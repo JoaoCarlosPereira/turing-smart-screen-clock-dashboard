@@ -1,0 +1,25 @@
+[Unit]
+Description=Relogio da tela Turing IPS
+Documentation=file:/mnt/dados/dsv/turing-smart-screen-python/RELOGIO.md
+# Start with the desktop session (USB/CDC already enumerated after login).
+After=graphical-session.target
+Wants=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/dados/dsv/turing-smart-screen-python
+# User is in dialout — run python directly so stop/kill actually ends the process.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do compgen -G "/dev/ttyACM*" >/dev/null && sleep 2 && exit 0; sleep 1; done; echo "Turing serial /dev/ttyACM* not found" >&2; exit 1'
+ExecStart=/mnt/dados/dsv/turing-smart-screen-python/.venv/bin/python clock-display.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=8
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

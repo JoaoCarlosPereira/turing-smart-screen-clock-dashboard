@@ -12,6 +12,10 @@
   
 A Python system monitor program and an abstraction library for **small IPS USB-C displays.**    
 
+> Configuração local: consulte [RELOGIO.md](RELOGIO.md) para usar a tela Turing
+> 3,5" como relógio no Linux, com início automático e recuperação após
+> desconexão USB.
+
 Supported operating systems : macOS, Windows, Linux (incl. Raspberry Pi), basically all OS that support Python 3.9+  
 
 ### ✅ Supported smart screens models:
