@@ -50,6 +50,10 @@ config:
   # Language is used by the API. Find more here https://openweathermap.org/api/one-call-3#multi
   WEATHER_LANGUAGE: en
 
+  # Host game helper: Windows PC broadcasts UDP (auto). AUTO/UDP = listen only.
+  # Optional explicit HTTP fallback: "http://192.168.2.177:8787"
+  HOST_GAME_HELPER_URL: AUTO
+
 display:
   # Display revision:
   # - A         for Turing 3.5" and UsbPCMonitor 3.5"/5"

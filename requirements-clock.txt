@@ -4,4 +4,5 @@ numpy>=2.0
 pyusb~=1.3
 pycryptodome~=3.23
 psutil>=5.9
-GPUtil>=1.4.0
+GPUtil>=1.4.0; python_version < "3.12"
+GPUtil @ https://github.com/mathoudebine/gputil/archive/refs/tags/1.4.1-py3.13.zip ; python_version >= "3.12"

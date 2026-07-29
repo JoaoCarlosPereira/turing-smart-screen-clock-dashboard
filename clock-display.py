@@ -2,21 +2,24 @@
 """Tech dashboard with Pop!_OS/COSMIC notification mirroring and multi-mode support.
 
 Modes:
-  - MAIN (default): Clock, date, and notification dashboard
+  - MAIN (default): Clock, date, weather (SMO/SC) and notification dashboard
   - MULTIMEDIA:     Spotify-like media info display (auto-detected via MPRIS2)
   - GAMER:          Gaming overlay with game info, FPS, hardware stats (auto-detected)
+  - LOCKED:         Session lock — time + lock icon at 10% brightness (OS theme)
 
 Usage:
   python clock-display.py                    # Auto-detect mode
   python clock-display.py --mode main        # Force MAIN mode
   python clock-display.py --mode multimedia  # Force MULTIMEDIA mode
   python clock-display.py --mode gamer       # Force GAMER mode
+  python clock-display.py --mode locked      # Force LOCKED mode
 """
 
 import argparse
 import hashlib
 import html
 import io
+import json
 import queue
 import re
 import shutil
@@ -25,9 +28,12 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlparse
 
 import serial
@@ -38,8 +44,8 @@ from library.lcd.lcd_comm_rev_a import LcdCommRevA, Orientation
 from library.log import logger
 
 # Import mode system
-from modes import Mode, ModeManager, MultimediaInfo, GamerInfo  # noqa: F401
-from modes import render_multimedia_mode, render_gamer_mode  # noqa: F401
+from modes import Mode, ModeManager, MultimediaInfo, GamerInfo, LockInfo  # noqa: F401
+from modes import render_multimedia_mode, render_gamer_mode, render_locked_mode  # noqa: F401
 from modes import _cover_fit, _extract_theme_colors  # noqa: F401
 
 
@@ -51,7 +57,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Turing Smart Screen — Clock Dashboard with Multi-Modes")
     parser.add_argument(
         "--mode",
-        choices=["main", "multimedia", "gamer"],
+        choices=["main", "multimedia", "gamer", "locked"],
         default=None,
         help="Force a display mode. If omitted, auto-detection is used.",
     )
@@ -72,6 +78,8 @@ MAGENTA = (214, 84, 255)
 WHITE = (236, 244, 255)
 MUTED = (126, 150, 176)
 GREEN = (78, 232, 168)
+ERROR_RED = (255, 72, 96)
+ERROR_AMBER = (255, 176, 64)
 GRID = (10, 20, 34)
 ACCENT_LINE = (24, 48, 72)
 FONT_REGULAR = "res/fonts/roboto/Roboto-Regular.ttf"
@@ -79,16 +87,22 @@ FONT_MEDIUM = "res/fonts/roboto/Roboto-Medium.ttf"
 FONT_BOLD = "res/fonts/roboto/Roboto-Bold.ttf"
 FONT_MONO = "res/fonts/roboto-mono/RobotoMono-Bold.ttf"
 NOTIFICATION_SECONDS = 5
-NOTIFICATION_RETENTION_SECONDS = 30 * 60  # clear dashboard note after 30 min idle
+NOTIFICATION_RETENTION_SECONDS = 15 * 60  # clear dashboard note after 15 min idle
 BRIGHTNESS = 100
+LOCKED_BRIGHTNESS = 10
+ACTIVE_BRIGHTNESS = BRIGHTNESS
 ORIENTATION = Orientation.REVERSE_LANDSCAPE
 SERIAL_WRITE_TIMEOUT = 2
 RECOVER_SLEEP_SECONDS = 3
 WATCHDOG_SECONDS = 12  # no successful frame → force recovery
 RECOVERY_COOLDOWN_SECONDS = 5
-SOFT_NUDGE_SECONDS = 45  # periodic soft reconnect to wake a blank panel
+SOFT_NUDGE_SECONDS = 120  # soft wake only; avoid hammering Rev A
+HARD_NUDGE_EVERY = 0  # disabled: periodic hard Reset was corrupting a healthy panel
 # After cold boot the first Reset often "succeeds" while the panel stays blank.
+# Only run a second Reset if we still have no successful frames.
 BOOT_CONFIRM_HARD_SECONDS = 20
+# Region refreshed every second in LOCKED mode (must match clock placement)
+LOCKED_CLOCK_CROP = (40, 140, 440, 230)
 
 running = True
 notification_queue = queue.Queue()
@@ -175,14 +189,19 @@ class ResilientLcd(LcdCommRevA):
             logger.error("SerialException while writing to display")
             raise
 
-    def _wake_panel(self):
-        """Rev A often accepts serial writes while the panel stays dark — force on."""
+    def _wake_panel(self, *, set_orientation: bool = True):
+        """Rev A often accepts serial writes while the panel stays dark — force on.
+
+        Avoid repeating SetOrientation on periodic nudges: it can scramble the
+        Rev A framebuffer into a frozen/garbled image while serial still "works".
+        """
         try:
             self.ScreenOn()
         except Exception as exc:
             logger.debug("ScreenOn ignored: %s", exc)
-        self.SetBrightness(level=BRIGHTNESS)
-        self.SetOrientation(orientation=ORIENTATION)
+        self.SetBrightness(level=ACTIVE_BRIGHTNESS)
+        if set_orientation:
+            self.SetOrientation(orientation=ORIENTATION)
 
     def soft_bring_up(self):
         """Reconnect without hardware Reset (gentler; preferred for recovery)."""
@@ -251,6 +270,275 @@ class Notification:
     title: str
     body: str
     received_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Weather (Open-Meteo) — São Miguel do Oeste / SC (location not shown on UI)
+# ---------------------------------------------------------------------------
+
+WEATHER_LAT = -26.7253
+WEATHER_LON = -53.5184
+WEATHER_CACHE_SECONDS = 12 * 60  # refresh ~every 12 minutes
+WEATHER_TIMEOUT_SECONDS = 2.5
+RAIN_BLUE = (72, 168, 255)
+
+_WEATHER_CACHE: Optional["WeatherInfo"] = None
+_WEATHER_FETCHED_AT = 0.0
+
+# WMO weather interpretation codes → short PT labels
+_WEATHER_CODE_PT = {
+    0: "Céu limpo",
+    1: "Principalmente limpo",
+    2: "Parcialmente nublado",
+    3: "Nublado",
+    45: "Neblina",
+    48: "Neblina gelada",
+    51: "Garoa fraca",
+    53: "Garoa",
+    55: "Garoa forte",
+    56: "Garoa gelada",
+    57: "Garoa gelada",
+    61: "Chuva fraca",
+    63: "Chuva",
+    65: "Chuva forte",
+    66: "Chuva gelada",
+    67: "Chuva gelada",
+    71: "Neve fraca",
+    73: "Neve",
+    75: "Neve forte",
+    77: "Grãos de neve",
+    80: "Pancadas fracas",
+    81: "Pancadas",
+    82: "Pancadas fortes",
+    85: "Pancadas de neve",
+    86: "Pancadas de neve",
+    95: "Tempestade",
+    96: "Tempestade com granizo",
+    99: "Tempestade com granizo",
+}
+
+
+@dataclass
+class WeatherInfo:
+    temperature: float = 0.0
+    weather_code: int = 0
+    humidity: float = 0.0
+    wind_kmh: float = 0.0
+    temp_max: float = 0.0
+    temp_min: float = 0.0
+    precip_prob: float = 0.0
+    condition: str = ""
+    hourly_precip_prob: list[float] = field(default_factory=list)  # 24 values, local hours 0–23
+    fetched_at: float = 0.0
+    ok: bool = False
+
+
+def weather_condition_pt(code: int) -> str:
+    return _WEATHER_CODE_PT.get(int(code), "Condição desconhecida")
+
+
+def remaining_day_precip_prob(hourly: list[float], now_hour: int, day_max: float) -> float:
+    """Daily rain % still ahead: day_max scaled by remaining hourly probability mass.
+
+    Example: day_max=100, 70% of the day's precip-mass already passed → ~30%.
+    Current hour counts as remaining.
+    """
+    day_max = max(0.0, min(100.0, float(day_max or 0.0)))
+    now_hour = max(0, min(23, int(now_hour)))
+    vals: list[float] = []
+    for i in range(24):
+        try:
+            vals.append(max(0.0, float(hourly[i] or 0.0)))
+        except (IndexError, TypeError, ValueError):
+            vals.append(0.0)
+    past = sum(vals[:now_hour])
+    rest = sum(vals[now_hour:])
+    total = past + rest
+    if total <= 0:
+        return 0.0
+    return max(0.0, min(100.0, day_max * (rest / total)))
+
+
+def fetch_weather(force: bool = False) -> Optional[WeatherInfo]:
+    """Fetch/cached Open-Meteo conditions for São Miguel do Oeste - SC."""
+    global _WEATHER_CACHE, _WEATHER_FETCHED_AT
+    now_mono = time.monotonic()
+    if (
+        not force
+        and _WEATHER_CACHE is not None
+        and _WEATHER_CACHE.ok
+        and (now_mono - _WEATHER_FETCHED_AT) < WEATHER_CACHE_SECONDS
+    ):
+        return _WEATHER_CACHE
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
+        "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+        "&hourly=precipitation_probability"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&timezone=America%2FSao_Paulo"
+        "&forecast_days=1"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "turing-clock/1.0"})
+        with urllib.request.urlopen(req, timeout=WEATHER_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        current = payload.get("current") or {}
+        daily = payload.get("daily") or {}
+        hourly = payload.get("hourly") or {}
+        code = int(current.get("weather_code") or 0)
+        raw_probs = hourly.get("precipitation_probability") or []
+        hourly_probs: list[float] = []
+        for i in range(24):
+            try:
+                hourly_probs.append(float(raw_probs[i] or 0.0))
+            except (IndexError, TypeError, ValueError):
+                hourly_probs.append(0.0)
+        info = WeatherInfo(
+            temperature=float(current.get("temperature_2m") or 0.0),
+            weather_code=code,
+            humidity=float(current.get("relative_humidity_2m") or 0.0),
+            wind_kmh=float(current.get("wind_speed_10m") or 0.0),
+            temp_max=float((daily.get("temperature_2m_max") or [0.0])[0] or 0.0),
+            temp_min=float((daily.get("temperature_2m_min") or [0.0])[0] or 0.0),
+            precip_prob=float((daily.get("precipitation_probability_max") or [0.0])[0] or 0.0),
+            condition=weather_condition_pt(code),
+            hourly_precip_prob=hourly_probs,
+            fetched_at=now_mono,
+            ok=True,
+        )
+        _WEATHER_CACHE = info
+        _WEATHER_FETCHED_AT = now_mono
+        return info
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        logger.debug("Open-Meteo weather fetch failed: %s", exc)
+        if _WEATHER_CACHE is not None and _WEATHER_CACHE.ok:
+            return _WEATHER_CACHE
+        return None
+
+
+def _draw_weather_icon(draw, box, code: int, color):
+    """Bold geometric weather glyph — readable at ~44px on IPS."""
+    x1, y1, x2, y2 = box
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    code = int(code)
+    span = max(28, min(x2 - x1, y2 - y1))
+    s = span / 96.0
+    w = max(2, int(3 * s))
+    sun = (255, 196, 72)
+    cloud = color
+    drop = RAIN_BLUE
+
+    def _xy(dx, dy):
+        return (cx + int(dx * s), cy + int(dy * s))
+
+    def _sun(ox=0, oy=0, r=16):
+        draw.ellipse((*_xy(ox - r, oy - r), *_xy(ox + r, oy + r)), fill=sun)
+        for dx, dy in ((0, -26), (0, 26), (-26, 0), (26, 0), (-18, -18), (18, -18), (-18, 18), (18, 18)):
+            draw.line((*_xy(ox + dx / 2.4, oy + dy / 2.4), *_xy(ox + dx, oy + dy)), fill=sun, width=w)
+
+    def _cloud(ox=0, oy=2):
+        draw.ellipse((*_xy(ox - 22, oy - 12), *_xy(ox + 2, oy + 10)), fill=cloud)
+        draw.ellipse((*_xy(ox - 6, oy - 18), *_xy(ox + 22, oy + 8)), fill=cloud)
+        draw.rounded_rectangle((*_xy(ox - 20, oy - 2), *_xy(ox + 20, oy + 14)), radius=max(4, int(7 * s)), fill=cloud)
+
+    if code == 0:
+        _sun()
+        return
+    if code in (1, 2):
+        _sun(ox=-10, oy=-10, r=12)
+        _cloud(ox=4, oy=6)
+        return
+    if code in (3, 45, 48):
+        _cloud()
+        return
+    if code >= 95:
+        _cloud(oy=-4)
+        bolt = [_xy(-2, -2), _xy(10, -2), _xy(2, 10), _xy(12, 10), _xy(-8, 28), _xy(0, 10), _xy(-6, 10)]
+        draw.polygon(bolt, fill=ERROR_AMBER)
+        return
+    # rain / drizzle / showers / snow
+    _cloud(oy=-6)
+    for ox in (-10, 2, 14):
+        draw.line((*_xy(ox, 12), *_xy(ox - 3, 24)), fill=drop, width=max(2, w))
+
+
+def _rain_bar_color(prob: float, is_now: bool):
+    """Yellow bars for the day; only the current hour is blue."""
+    if is_now:
+        return RAIN_BLUE
+    if prob <= 0:
+        return (72, 56, 28)
+    return ERROR_AMBER
+
+
+def _text_with_shadow(draw, xy, text, font, fill, anchor=None, shadow=(0, 0, 0)):
+    """Light dark halo so glyphs stay readable over wallpaper / bars."""
+    x, y = xy
+    kwargs = {}
+    if anchor is not None:
+        kwargs["anchor"] = anchor
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1)):
+        draw.text((x + dx, y + dy), text, font=font, fill=shadow, **kwargs)
+    draw.text((x, y), text, font=font, fill=fill, **kwargs)
+
+
+def _draw_rain_timeline(draw, box, probs: list[float], now_hour: int, accent, label_font, axis_font):
+    """Day rain strip: 12×2h bars labeled 00/02/…/22 with a now marker."""
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    hours = 12
+    slots: list[float] = []
+    for i in range(hours):
+        vals = []
+        for h in (i * 2, i * 2 + 1):
+            try:
+                vals.append(float(probs[h] or 0.0))
+            except (IndexError, TypeError, ValueError):
+                vals.append(0.0)
+        slots.append(max(vals) if vals else 0.0)
+
+    header_h = 18
+    axis_h = 26
+    chart_top = y1 + header_h
+    chart_bottom = y2 - axis_h
+    chart_h = max(10, chart_bottom - chart_top)
+
+    # Soft plate behind title + axis so wallpaper doesn't wash out the labels
+    draw.rounded_rectangle((x1 - 4, y1 - 4, x2 + 4, chart_top - 2), radius=6, fill=(8, 10, 14))
+    draw.rounded_rectangle((x1 - 4, chart_bottom + 2, x2 + 4, y2 + 2), radius=6, fill=(8, 10, 14))
+
+    _text_with_shadow(draw, (x1, y1 - 1), "Chuva", label_font, WHITE)
+
+    gap = 3
+    usable = max(hours, x2 - x1)
+    bar_w = max(8, (usable - gap * (hours - 1)) // hours)
+    total_w = hours * bar_w + (hours - 1) * gap
+    ox = x1 + max(0, (usable - total_w) // 2)
+    now_hour = max(0, min(23, int(now_hour)))
+    now_slot = now_hour // 2
+
+    draw.rectangle((ox, chart_bottom - 1, ox + total_w - 1, chart_bottom), fill=(40, 48, 60))
+
+    for i, p in enumerate(slots):
+        is_now = i == now_slot
+        h = max(3, int(chart_h * (p / 100.0))) if p > 0 else 2
+        bx1 = ox + i * (bar_w + gap)
+        bx2 = bx1 + bar_w - 1
+        by1 = chart_bottom - h
+        color = _rain_bar_color(p, is_now)
+        draw.rounded_rectangle((bx1, by1, bx2, chart_bottom), radius=2, fill=color)
+        if is_now:
+            draw.rectangle((bx1, chart_top, bx2, chart_top + 2), fill=RAIN_BLUE)
+            draw.rectangle((bx1, chart_bottom + 1, bx2, chart_bottom + 2), fill=RAIN_BLUE)
+
+        cx = bx1 + bar_w // 2
+        hour_color = RAIN_BLUE if is_now else WHITE
+        _text_with_shadow(draw, (cx, y2), f"{i * 2:02d}", axis_font, hour_color, anchor="mb")
 
 
 ICON_CACHE: dict[tuple[str, str, int], Image.Image | None] = {}
@@ -568,8 +856,8 @@ def wrap_text(draw, value, selected_font, max_width, max_lines):
 # ---------------------------------------------------------------------------
 
 _SYSTEM_THEME_CACHE: dict | None = None
-_SYSTEM_THEME_CHECKED_AT = 0.0
-_SYSTEM_THEME_TTL = 30.0  # re-read wallpaper/accent periodically
+_SYSTEM_THEME_FINGERPRINT = ""
+THEME_WATCH_SECONDS = 2.0  # how often MAIN polls desktop environment changes
 
 
 def _hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -615,24 +903,49 @@ def _cosmic_panel_hex() -> str | None:
     return match.group(1) if match else None
 
 
+def _cosmic_same_on_all() -> bool:
+    path = Path.home() / ".config/cosmic/com.system76.CosmicBackground/v1/same-on-all"
+    try:
+        return path.read_text(encoding="utf-8").strip().lower() == "true"
+    except OSError:
+        return False
+
+
+def _parse_cosmic_wallpaper_source(config_path: Path) -> Path | None:
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = re.search(r'source:\s*Path\("([^"]+)"\)', text)
+    if not match:
+        match = re.search(r'Path\("([^"]+)"\)', text)
+    if not match:
+        return None
+    wallpaper = Path(match.group(1))
+    return wallpaper if wallpaper.is_file() else None
+
+
 def _cosmic_wallpaper_path() -> Path | None:
+    """Resolve the active COSMIC wallpaper (respects same-on-all)."""
     root = Path.home() / ".config/cosmic/com.system76.CosmicBackground/v1"
     if not root.is_dir():
         return None
-    candidates = sorted(root.glob("output.*")) + [root / "all"]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        match = re.search(r'Path\("([^"]+)"\)', text)
-        if match:
-            wallpaper = Path(match.group(1))
-            if wallpaper.is_file():
-                return wallpaper
-    return None
+
+    # When same-on-all is true, COSMIC applies `all` to every display.
+    # Per-output files can stay stale and must not win.
+    if _cosmic_same_on_all():
+        wallpaper = _parse_cosmic_wallpaper_source(root / "all")
+        if wallpaper is not None:
+            return wallpaper
+
+    outputs = [p for p in root.glob("output.*") if p.is_file()]
+    outputs.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for path in outputs:
+        wallpaper = _parse_cosmic_wallpaper_source(path)
+        if wallpaper is not None:
+            return wallpaper
+
+    return _parse_cosmic_wallpaper_source(root / "all")
 
 
 def _gsettings_wallpaper_path() -> Path | None:
@@ -654,14 +967,80 @@ def _gsettings_wallpaper_path() -> Path | None:
     return None
 
 
+def _theme_watch_paths() -> list[Path]:
+    """COSMIC / desktop files that define wallpaper and accent."""
+    home = Path.home()
+    paths = [
+        home / ".config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark",
+        home / ".config/cosmic/com.system76.CosmicTheme.Dark/v2/accent",
+        home / ".config/cosmic/com.system76.CosmicTheme.Dark/v2/background",
+        home / ".config/cosmic/com.system76.CosmicTheme.Light/v2/accent",
+        home / ".config/cosmic/com.system76.CosmicTheme.Light/v2/background",
+        home / ".config/cosmic/com.system76.CosmicBackground/v1/all",
+        home / ".config/cosmic/com.system76.CosmicBackground/v1/backgrounds",
+        home / ".config/cosmic/com.system76.CosmicBackground/v1/same-on-all",
+    ]
+    bg_root = home / ".config/cosmic/com.system76.CosmicBackground/v1"
+    if bg_root.is_dir():
+        paths.extend(sorted(bg_root.glob("output.*")))
+    return paths
+
+
+def system_theme_fingerprint() -> str:
+    """Cheap fingerprint of desktop wallpaper/accent/theme inputs."""
+    parts: list[str] = []
+    for path in _theme_watch_paths():
+        try:
+            st = path.stat()
+            parts.append(f"{path}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f"{path}:missing")
+        # Also hash the Path("...") source line so wallpaper swaps are detected
+        # even if another stale output.* file would have been preferred before.
+        if "CosmicBackground" in str(path) and path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                match = re.search(r'source:\s*Path\("([^"]+)"\)', text)
+                if match:
+                    parts.append(f"src:{path.name}:{match.group(1)}")
+                elif path.name == "same-on-all":
+                    parts.append(f"same:{text.strip()}")
+            except OSError:
+                pass
+
+    wallpaper = _cosmic_wallpaper_path() or _gsettings_wallpaper_path()
+    if wallpaper is not None:
+        try:
+            st = wallpaper.stat()
+            parts.append(f"wp:{wallpaper}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f"wp:{wallpaper}:missing")
+    else:
+        parts.append("wp:none")
+        # GNOME fallback only when COSMIC wallpaper config is absent
+        for key in ("picture-uri-dark", "picture-uri", "primary-color", "secondary-color"):
+            try:
+                out = subprocess.check_output(
+                    ["gsettings", "get", "org.gnome.desktop.background", key],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1,
+                ).strip()
+                parts.append(f"gs:{key}:{out}")
+            except (subprocess.SubprocessError, OSError):
+                parts.append(f"gs:{key}:na")
+
+    return hashlib.sha1("|".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+
+
 def load_system_theme(force: bool = False) -> dict:
-    """Load Pop!_OS / COSMIC wallpaper + accent colors (cached)."""
-    global _SYSTEM_THEME_CACHE, _SYSTEM_THEME_CHECKED_AT
-    now = time.monotonic()
+    """Load Pop!_OS / COSMIC wallpaper + accent colors (reload when desktop changes)."""
+    global _SYSTEM_THEME_CACHE, _SYSTEM_THEME_FINGERPRINT
+    fingerprint = system_theme_fingerprint()
     if (
         not force
         and _SYSTEM_THEME_CACHE is not None
-        and now - _SYSTEM_THEME_CHECKED_AT < _SYSTEM_THEME_TTL
+        and fingerprint == _SYSTEM_THEME_FINGERPRINT
     ):
         return _SYSTEM_THEME_CACHE
 
@@ -687,6 +1066,7 @@ def load_system_theme(force: bool = False) -> dict:
         except OSError as exc:
             logger.debug("Failed to load wallpaper %s: %s", wallpaper_path, exc)
 
+    changed = bool(_SYSTEM_THEME_FINGERPRINT) and fingerprint != _SYSTEM_THEME_FINGERPRINT
     theme = {
         "wallpaper": wallpaper,
         "wallpaper_path": str(wallpaper_path) if wallpaper_path else "",
@@ -694,9 +1074,18 @@ def load_system_theme(force: bool = False) -> dict:
         "accent2": accent2,
         "panel": panel,
         "is_dark": _cosmic_is_dark(),
+        "fingerprint": fingerprint,
+        "changed": changed,
     }
+    if changed:
+        logger.info(
+            "Desktop environment theme updated (wallpaper=%s accent=%s dark=%s)",
+            theme["wallpaper_path"] or "none",
+            accent,
+            theme["is_dark"],
+        )
     _SYSTEM_THEME_CACHE = theme
-    _SYSTEM_THEME_CHECKED_AT = now
+    _SYSTEM_THEME_FINGERPRINT = fingerprint
     return theme
 
 
@@ -747,12 +1136,11 @@ def draw_corner_marks(draw, box, color):
 
 
 # Region refreshed every second (must match clock placement in render_dashboard)
-MAIN_CLOCK_CROP = (18, 48, 360, 150)
+MAIN_CLOCK_CROP = (16, 6, 380, 82)
 
 
 def render_dashboard(now, last_notification=None):
     """MAIN mode: wallpaper-first desktop HUD matching GAMER/MULTIMEDIA energy."""
-    import socket
     from PIL import ImageEnhance
 
     theme = load_system_theme()
@@ -771,11 +1159,11 @@ def render_dashboard(now, last_notification=None):
 
     wash = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     wash_draw = ImageDraw.Draw(wash)
-    wash_draw.rectangle((0, 0, WIDTH, 44), fill=(ar, ag, ab, 75))
-    # Soft contrast behind clock / date (same idea as MULTIMEDIA)
-    wash_draw.rounded_rectangle((14, 40, 466, 168), radius=16, fill=(0, 0, 0, 130))
-    for y in range(210, HEIGHT):
-        t = (y - 210) / max(1, HEIGHT - 210)
+    # Compact clock band — frees vertical space for weather / notifications
+    wash_draw.rectangle((0, 0, WIDTH, 4), fill=(ar, ag, ab, 110))
+    wash_draw.rounded_rectangle((14, 6, 466, 84), radius=12, fill=(0, 0, 0, 130))
+    for y in range(120, HEIGHT):
+        t = (y - 120) / max(1, HEIGHT - 120)
         wash_draw.line((0, y, WIDTH, y), fill=(4, 6, 10, int(50 + 190 * t)))
     image = Image.alpha_composite(image, wash)
 
@@ -783,71 +1171,186 @@ def render_dashboard(now, last_notification=None):
     draw = ImageDraw.Draw(image_rgb)
     draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=accent, width=3)
 
-    host = socket.gethostname().split(".")[0][:18].upper() or "POP OS"
-    badge = f"COSMIC · {host}"
-    badge_w = max(120, int(draw.textlength(badge, font=font(FONT_MONO, 12)) + 24))
-    draw.rounded_rectangle((22, 18, 22 + badge_w, 40), radius=8, fill=accent)
-    draw.text((22 + badge_w // 2, 29), badge, font=font(FONT_MONO, 12), fill=(12, 12, 14), anchor="mm")
-
     clock = now.strftime("%H:%M:%S")
-    draw.text((26, 76), clock, font=font(FONT_MONO, 58), fill=(0, 0, 0), anchor="lm")
-    draw.text((24, 74), clock, font=font(FONT_MONO, 58), fill=WHITE, anchor="lm")
+    clock_font = font(FONT_MONO, 50)
+    draw.text((24, 47), clock, font=clock_font, fill=(0, 0, 0), anchor="lm")
+    draw.text((22, 45), clock, font=clock_font, fill=WHITE, anchor="lm")
 
+    # Date without year; weekday raised into the freed row
     date_str = now.strftime("%d %b").upper()
-    year_str = now.strftime("%Y")
     day_str = now.strftime("%A").upper()
-    draw.text((446, 58), date_str, font=font(FONT_BOLD, 22), fill=accent, anchor="ra")
-    draw.text((446, 86), year_str, font=font(FONT_MONO, 16), fill=WHITE, anchor="ra")
-    draw.text((446, 112), day_str, font=font(FONT_MEDIUM, 16), fill=accent2, anchor="ra")
+    draw.text((446, 16), date_str, font=font(FONT_BOLD, 28), fill=accent, anchor="ra")
+    draw.text((446, 48), day_str, font=font(FONT_MEDIUM, 22), fill=accent2, anchor="ra")
 
-    draw.rectangle((22, 160, 458, 163), fill=accent)
+    draw.rectangle((22, 90, 458, 93), fill=accent)
 
     note_scrim = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    ImageDraw.Draw(note_scrim).rounded_rectangle((14, 176, 466, 308), radius=16, fill=(0, 0, 0, 140))
+    ImageDraw.Draw(note_scrim).rounded_rectangle((14, 100, 466, 308), radius=16, fill=(0, 0, 0, 140))
     image_rgb = Image.alpha_composite(image_rgb.convert("RGBA"), note_scrim).convert("RGB")
     draw = ImageDraw.Draw(image_rgb)
 
-    icon_box = (28, 192, 116, 280)
-    draw.rounded_rectangle(
-        (icon_box[0] - 3, icon_box[1] - 3, icon_box[2] + 3, icon_box[3] + 3),
-        radius=14,
-        outline=accent,
-        width=3,
-    )
-    draw.rounded_rectangle(icon_box, radius=12, fill=(10, 12, 16))
-
     if last_notification is None:
-        draw.line((52, 236, 92, 236), fill=accent, width=4)
-        draw.line((72, 216, 72, 256), fill=accent, width=4)
-        draw.text((136, 208), "Nenhuma notificação", font=font(FONT_BOLD, 26), fill=WHITE)
-        draw.text((136, 248), "Desktop pronto · aguardando alertas", font=font(FONT_REGULAR, 16), fill=accent)
-        draw.text((446, 188), now.strftime("%H:%M"), font=font(FONT_MONO, 14), fill=MUTED, anchor="ra")
+        weather = fetch_weather()
+        if weather is not None and weather.ok:
+            # Hero: glyph + large temp; condition top-right; compact meta; rain strip
+            icon_box = (26, 110, 80, 164)
+            _draw_weather_icon(draw, icon_box, weather.weather_code, accent)
+
+            temp = f"{weather.temperature:.0f}°"
+            temp_font = font(FONT_BOLD, 56)
+            draw.text((94, 140), temp, font=temp_font, fill=(0, 0, 0), anchor="lm")
+            draw.text((92, 138), temp, font=temp_font, fill=WHITE, anchor="lm")
+
+            cond = weather.condition or "—"
+            cond_font = font(FONT_MEDIUM, 22)
+            while cond and draw.textlength(cond, font=cond_font) > 230:
+                cond = cond[:-1]
+            if cond != (weather.condition or ""):
+                cond = cond.rstrip() + "…"
+            draw.text((446, 118), cond, font=cond_font, fill=accent2, anchor="ra")
+
+            meta_font = font(FONT_MONO, 17)
+            meta_left = f"máx {weather.temp_max:.0f}° · mín {weather.temp_min:.0f}°"
+            draw.text((92, 176), meta_left, font=meta_font, fill=MUTED, anchor="lm")
+
+            rain_left = remaining_day_precip_prob(
+                weather.hourly_precip_prob, now.hour, weather.precip_prob
+            )
+            parts = [
+                ("Chuva ", MUTED),
+                (f"{rain_left:.0f}%", ERROR_AMBER if rain_left >= 50 else accent),
+                (f"  ·  Um {weather.humidity:.0f}%", MUTED),
+                (f"  ·  {weather.wind_kmh:.0f} km/h", MUTED),
+            ]
+            left_w = int(draw.textlength(meta_left, font=meta_font))
+            right_budget = max(80, 446 - (92 + left_w + 28))
+
+            def _parts_width(items):
+                return sum(draw.textlength(t, font=meta_font) for t, _ in items)
+
+            while len(parts) > 2 and _parts_width(parts) > right_budget:
+                parts.pop()
+            x = 446 - int(_parts_width(parts))
+            for text, color in parts:
+                draw.text((x, 176), text, font=meta_font, fill=color, anchor="lm")
+                x += int(draw.textlength(text, font=meta_font))
+
+            _draw_rain_timeline(
+                draw,
+                (24, 200, 456, 304),
+                weather.hourly_precip_prob,
+                now.hour,
+                accent,
+                font(FONT_MONO, 16),
+                font(FONT_MONO, 18),
+            )
+        else:
+            icon_box = (28, 126, 124, 270)
+            draw.rounded_rectangle(
+                (icon_box[0] - 3, icon_box[1] - 3, icon_box[2] + 3, icon_box[3] + 3),
+                radius=14,
+                outline=accent,
+                width=3,
+            )
+            draw.rounded_rectangle(icon_box, radius=12, fill=(10, 12, 16))
+            draw.line((54, 198, 98, 198), fill=accent, width=4)
+            draw.line((76, 176, 76, 220), fill=accent, width=4)
+            draw.text((144, 148), "Nenhuma notificação", font=font(FONT_BOLD, 32), fill=WHITE)
+            draw.text((144, 196), "Clima indisponível · aguardando alertas", font=font(FONT_REGULAR, 20), fill=accent)
+            draw.text((446, 124), now.strftime("%H:%M"), font=font(FONT_MONO, 17), fill=MUTED, anchor="ra")
     else:
-        app_icon = load_notification_icon(last_notification.icon, last_notification.app, 80)
+        icon_box = (28, 126, 124, 270)
+        draw.rounded_rectangle(
+            (icon_box[0] - 3, icon_box[1] - 3, icon_box[2] + 3, icon_box[3] + 3),
+            radius=14,
+            outline=accent,
+            width=3,
+        )
+        draw.rounded_rectangle(icon_box, radius=12, fill=(10, 12, 16))
+        app_icon = load_notification_icon(last_notification.icon, last_notification.app, 88)
         if app_icon is not None:
             paste_rounded_icon(image_rgb, app_icon, icon_box, radius=12)
         else:
-            draw.text((72, 236), "!", font=font(FONT_BOLD, 34), fill=WHITE, anchor="mm")
+            draw.text((76, 198), "!", font=font(FONT_BOLD, 36), fill=WHITE, anchor="mm")
         draw.text(
-            (446, 188),
+            (446, 124),
             last_notification.received_at.strftime("%H:%M"),
-            font=font(FONT_MONO, 14),
+            font=font(FONT_MONO, 17),
             fill=MUTED,
             anchor="ra",
         )
         app_name = (last_notification.app or "SISTEMA").upper()
-        draw.text((136, 192), app_name, font=font(FONT_MONO, 12), fill=accent)
-        title_font = font(FONT_BOLD, 24)
-        body_font = font(FONT_REGULAR, 18)
-        title = wrap_text(draw, last_notification.title, title_font, 290, 1)
-        body = wrap_text(draw, clean_notification_body(last_notification.body), body_font, 290, 2)
-        draw.text((136, 214), title[0] if title else "Nova notificação", font=title_font, fill=WHITE)
-        body_y = 250
+        draw.text((144, 128), app_name, font=font(FONT_MONO, 15), fill=accent)
+        title_font = font(FONT_BOLD, 30)
+        body_font = font(FONT_REGULAR, 21)
+        title = wrap_text(draw, last_notification.title, title_font, 300, 1)
+        body = wrap_text(draw, clean_notification_body(last_notification.body), body_font, 300, 5)
+        draw.text((144, 156), title[0] if title else "Nova notificação", font=title_font, fill=WHITE)
+        body_y = 198
         for line in body:
-            draw.text((136, body_y), line, font=body_font, fill=(230, 232, 240))
-            body_y += 24
+            draw.text((144, body_y), line, font=body_font, fill=(230, 232, 240))
+            body_y += 28
 
     return image_rgb
+
+
+def render_error_screen(
+    title: str,
+    detail: str = "",
+    hint: str = "Tentando recuperar…",
+    now: datetime | None = None,
+):
+    """Fullscreen error / recovery status for the IPS panel."""
+    now = now or datetime.now().astimezone()
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=ERROR_RED, width=3)
+    draw.rectangle((0, 0, WIDTH, 8), fill=ERROR_RED)
+    draw.rounded_rectangle((16, 28, 464, 292), radius=16, fill=PANEL, outline=ERROR_RED, width=2)
+    draw_corner_marks(draw, (28, 40, 452, 280), ERROR_AMBER)
+
+    badge = "ERRO"
+    bw = max(64, int(draw.textlength(badge, font=font(FONT_MONO, 14)) + 24))
+    draw.rounded_rectangle((36, 48, 36 + bw, 74), radius=8, fill=ERROR_RED)
+    draw.text((36 + bw // 2, 61), badge, font=font(FONT_MONO, 14), fill=(12, 12, 14), anchor="mm")
+    draw.text((446, 61), now.strftime("%H:%M:%S"), font=font(FONT_MONO, 16), fill=MUTED, anchor="rm")
+
+    title_text = (title or "Falha na tela").strip() or "Falha na tela"
+    title_font = font(FONT_BOLD, 28)
+    title_y = 96
+    for line in wrap_text(draw, title_text, title_font, 400, 2):
+        draw.text((40, title_y), line, font=title_font, fill=WHITE)
+        title_y += 34
+
+    draw.line((36, title_y + 6, 444, title_y + 6), fill=ERROR_AMBER, width=2)
+    body_y = title_y + 20
+    detail_font = font(FONT_REGULAR, 18)
+    detail_text = clean_markup(detail) if detail else "Sem detalhes adicionais."
+    for line in wrap_text(draw, detail_text, detail_font, 400, 4):
+        draw.text((40, body_y), line, font=detail_font, fill=MUTED)
+        body_y += 24
+
+    hint_font = font(FONT_MEDIUM, 16)
+    draw.text((40, 258), hint, font=hint_font, fill=ERROR_AMBER)
+    draw.rectangle((36, 278, 444, 284), fill=(20, 24, 28))
+    draw.rectangle((36, 278, 220, 284), fill=ERROR_RED)
+    return image
+
+
+def try_show_error(
+    lcd: ResilientLcd,
+    title: str,
+    detail: str = "",
+    hint: str = "Tentando recuperar…",
+) -> bool:
+    """Best-effort error frame; never raises into the caller."""
+    try:
+        refresh_full_frame(lcd, render_error_screen(title, detail, hint))
+        return True
+    except Exception as exc:
+        logger.debug("Could not show error screen: %s", exc)
+        return False
 
 
 def render_notification(item, now):
@@ -1065,6 +1568,27 @@ def mark_frame_ok():
     last_successful_frame_at = time.monotonic()
 
 
+def brightness_for_mode(mode: Mode) -> int:
+    """Panel brightness for the active mode (LOCKED dims to 10%)."""
+    if mode == Mode.LOCKED:
+        return LOCKED_BRIGHTNESS
+    return BRIGHTNESS
+
+
+def apply_mode_brightness(lcd: ResilientLcd, mode: Mode):
+    """Apply mode brightness and keep ACTIVE_BRIGHTNESS in sync for soft nudges."""
+    global ACTIVE_BRIGHTNESS
+    level = brightness_for_mode(mode)
+    if level == ACTIVE_BRIGHTNESS:
+        return
+    ACTIVE_BRIGHTNESS = level
+    try:
+        lcd.SetBrightness(level=level)
+        logger.info("Brightness set to %s%% for mode %s", level, mode.name)
+    except Exception as exc:
+        logger.debug("SetBrightness(%s) failed: %s", level, exc)
+
+
 def refresh_full_frame(lcd: ResilientLcd, image: Image.Image):
     """Send a full-frame PIL image and mark heartbeat."""
     lcd.DisplayPILImage(image)
@@ -1084,6 +1608,8 @@ def redraw_current_mode(lcd: ResilientLcd, mode_manager, now, last_notification)
         refresh_full_frame(lcd, render_multimedia_mode(mode_manager.state.multimedia, now))
     elif mode == Mode.GAMER:
         refresh_full_frame(lcd, render_gamer_mode(mode_manager.state.gamer, now))
+    elif mode == Mode.LOCKED:
+        refresh_full_frame(lcd, render_locked_mode(now, load_system_theme()))
     else:
         refresh_full_frame(lcd, render_dashboard(now, last_notification))
 
@@ -1115,6 +1641,13 @@ def recover_display(lcd: ResilientLcd, mode_manager, last_notification, reason: 
         return False
     logger.warning("Automatic display recovery (%s)", reason)
     last_recovery_at = now_mono
+    # Show a visible fault state before tearing down the serial link.
+    try_show_error(
+        lcd,
+        "ERRO DE DISPLAY",
+        reason,
+        "Reconectando a tela…",
+    )
     # Alternate: soft first, then hard if we recover again soon
     if "watchdog" in reason.lower() or "nudge" in reason.lower():
         recovery_hard_next = False
@@ -1122,6 +1655,14 @@ def recover_display(lcd: ResilientLcd, mode_manager, last_notification, reason: 
     if not running:
         return False
     try:
+        # Confirm bring-up with the error frame, then restore the active mode.
+        try_show_error(
+            lcd,
+            "DISPLAY RECUPERADO",
+            reason,
+            "Restaurando o painel…",
+        )
+        time.sleep(0.4)
         redraw_current_mode(lcd, mode_manager, datetime.now().astimezone(), last_notification)
         last_soft_nudge_at = time.monotonic()
         logger.info("Display recovery succeeded")
@@ -1130,6 +1671,12 @@ def recover_display(lcd: ResilientLcd, mode_manager, last_notification, reason: 
         return True
     except (serial.SerialException, OSError) as redraw_exc:
         logger.warning("Redraw after recovery failed (%s); escalating to hard reset", redraw_exc)
+        try_show_error(
+            lcd,
+            "FALHA NA RECUPERAÇÃO",
+            str(redraw_exc),
+            "Nova tentativa em breve…",
+        )
         recovery_hard_next = True
         return False
 
@@ -1141,204 +1688,309 @@ def needs_watchdog_recovery() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mode manager initialization
+# Main entry (import-safe)
 # ---------------------------------------------------------------------------
 
-args = parse_args()
-mode_manager = ModeManager(config_mode=args.mode)
+if __name__ == "__main__":
+    args = parse_args()
+    mode_manager = ModeManager(config_mode=args.mode)
 
-# Determine which mode to show initially
-initial_mode = mode_manager.state.current_mode
-logger.info("Starting in mode: %s", initial_mode.name)
+    # Determine which mode to show initially
+    initial_mode = mode_manager.state.current_mode
+    logger.info("Starting in mode: %s", initial_mode.name)
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Main loop
+    # ---------------------------------------------------------------------------
 
-lcd = ResilientLcd(com_port="AUTO", display_width=320, display_height=480)
+    lcd = ResilientLcd(com_port="AUTO", display_width=320, display_height=480)
 
-try:
-    recovery_hard_next = True  # first start / wake blank panel with hardware reset
-    wait_for_display(lcd)
-    threading.Thread(target=notification_monitor, name="notification-monitor", daemon=True).start()
+    try:
+        recovery_hard_next = True  # first start / wake blank panel with hardware reset
+        wait_for_display(lcd)
+        threading.Thread(target=notification_monitor, name="notification-monitor", daemon=True).start()
 
-    last_second = None
-    last_date = None
-    last_minute = None
-    overlay_until = 0.0
-    overlay_active = False
-    last_notification = None
+        last_second = None
+        last_date = None
+        last_minute = None
+        overlay_until = 0.0
+        overlay_active = False
+        last_notification = None
 
-    # Render initial screen based on mode
-    if initial_mode == Mode.MAIN:
-        refresh_full_frame(lcd, render_dashboard(datetime.now().astimezone(), last_notification))
-    elif initial_mode == Mode.MULTIMEDIA:
-        refresh_full_frame(lcd, render_multimedia_mode(mode_manager.state.multimedia, datetime.now().astimezone()))
-    elif initial_mode == Mode.GAMER:
-        refresh_full_frame(lcd, render_gamer_mode(mode_manager.state.gamer, datetime.now().astimezone()))
+        # Render initial screen based on mode
+        apply_mode_brightness(lcd, initial_mode)
+        if initial_mode == Mode.MAIN:
+            refresh_full_frame(lcd, render_dashboard(datetime.now().astimezone(), last_notification))
+        elif initial_mode == Mode.MULTIMEDIA:
+            refresh_full_frame(lcd, render_multimedia_mode(mode_manager.state.multimedia, datetime.now().astimezone()))
+        elif initial_mode == Mode.GAMER:
+            refresh_full_frame(lcd, render_gamer_mode(mode_manager.state.gamer, datetime.now().astimezone()))
+        elif initial_mode == Mode.LOCKED:
+            refresh_full_frame(lcd, render_locked_mode(datetime.now().astimezone(), load_system_theme()))
 
-    # Detection interval (how often to check for mode changes)
-    DETECTION_INTERVAL = 3.0  # seconds
+        # Detection interval (how often to check for mode changes)
+        DETECTION_INTERVAL = 3.0  # seconds (game / media)
+        LOCK_POLL_INTERVAL = 1.0  # seconds (session lock — snappier)
 
-    # Mode-specific state
-    last_mode_detection_time = 0.0
-    mode_render_cache = None
-    mode_render_time = 0.0
-    MODE_CACHE_TTL = 3.0  # full frames are expensive on Rev A serial
-    last_track_key = ""
-    last_mode = mode_manager.state.current_mode
-    last_soft_nudge_at = time.monotonic()
-    boot_confirm_at = time.monotonic() + BOOT_CONFIRM_HARD_SECONDS
-    boot_confirm_done = False
+        # Mode-specific state
+        last_mode_detection_time = 0.0
+        last_lock_poll_time = 0.0
+        mode_render_cache = None
+        mode_render_time = 0.0
+        MODE_CACHE_TTL = 3.0  # full frames are expensive on Rev A serial
+        last_track_key = ""
+        last_mode = mode_manager.state.current_mode
+        last_soft_nudge_at = time.monotonic()
+        soft_nudge_count = 0
+        boot_confirm_at = time.monotonic() + BOOT_CONFIRM_HARD_SECONDS
+        boot_confirm_done = False
+        last_theme_check_at = 0.0
+        last_theme_fingerprint = load_system_theme().get("fingerprint", "")
 
-    while running:
-        try:
-            now = datetime.now().astimezone()
-            current_time = time.monotonic()
-
-            # Cold-boot: first "hard-ready" often leaves Rev A blank — second Reset wakes it.
-            if not boot_confirm_done and current_time >= boot_confirm_at:
-                boot_confirm_done = True
-                logger.info("Boot confirm: second hard reset to wake panel after login")
-                recovery_hard_next = True
-                last_recovery_at = 0.0  # bypass cooldown for this one-shot
-                if recover_display(lcd, mode_manager, last_notification, "boot confirm hard reset"):
-                    mode_render_time = 0.0
-                    last_second = None
-                    last_date = None
-                    last_minute = None
-                    last_track_key = ""
-                continue
-
-            # --- Mode detection (periodic, paused during notification overlay) ---
-            if not overlay_active and current_time - last_mode_detection_time >= DETECTION_INTERVAL:
-                previous = mode_manager.state.current_mode
-                mode_manager.detect_and_switch()
-                last_mode_detection_time = current_time
-                if mode_manager.state.current_mode != previous:
-                    # Force an immediate full redraw on mode change
-                    mode_render_time = 0.0
-                    last_second = None
-                    last_date = None
-                    last_minute = None
-                    last_track_key = ""
-                    last_mode = mode_manager.state.current_mode
-                    overlay_active = False
-
-            # --- Notifications: overlay for 5s in any mode ---
+        while running:
             try:
-                item = notification_queue.get_nowait()
-                while True:
-                    item = notification_queue.get_nowait()
-            except queue.Empty:
-                if "item" in locals():
-                    last_notification = item
-                    display_image(lcd, render_notification(item, now))
-                    overlay_until = time.monotonic() + NOTIFICATION_SECONDS
-                    overlay_active = True
-                    del item
+                now = datetime.now().astimezone()
+                current_time = time.monotonic()
 
-            if overlay_active:
-                if time.monotonic() >= overlay_until:
-                    redraw_current_mode(lcd, mode_manager, now, last_notification)
-                    overlay_active = False
-                    mode_render_time = 0.0
-                    last_second = now.strftime("%H:%M:%S")
-                    last_date = now.strftime("%Y-%m-%d")
-                    last_minute = now.strftime("%H:%M")
-                time.sleep(0.05)
-                continue
+                # Cold-boot: only second-reset if the panel never accepted a frame.
+                # A blind Reset on a working Rev A often leaves it garbled/frozen.
+                if not boot_confirm_done and current_time >= boot_confirm_at:
+                    boot_confirm_done = True
+                    if last_successful_frame_at > 0 and (
+                        current_time - last_successful_frame_at
+                    ) < WATCHDOG_SECONDS:
+                        logger.info(
+                            "Boot confirm skipped — display already receiving frames"
+                        )
+                    else:
+                        logger.info("Boot confirm: second hard reset (no successful frames yet)")
+                        recovery_hard_next = True
+                        last_recovery_at = 0.0  # bypass cooldown for this one-shot
+                        if recover_display(lcd, mode_manager, last_notification, "boot confirm hard reset"):
+                            mode_render_time = 0.0
+                            last_second = None
+                            last_date = None
+                            last_minute = None
+                            last_track_key = ""
+                        continue
 
-            # Clear dashboard notification area after 30 minutes without a new one
-            if last_notification is not None:
-                age = (now - last_notification.received_at).total_seconds()
-                if age >= NOTIFICATION_RETENTION_SECONDS:
-                    logger.info("Clearing notification area after %.0f min idle", age / 60)
-                    last_notification = None
-                    if mode_manager.state.current_mode == Mode.MAIN:
-                        refresh_full_frame(lcd, render_dashboard(now, None))
+                # --- Session lock poll (fast path, highest priority; runs even during overlays) ---
+                if current_time - last_lock_poll_time >= LOCK_POLL_INTERVAL:
+                    last_lock_poll_time = current_time
+                    previous = mode_manager.state.current_mode
+                    if mode_manager.poll_lock():
+                        mode_render_time = 0.0
+                        last_second = None
+                        last_date = None
+                        last_minute = None
+                        last_track_key = ""
+                        last_mode = mode_manager.state.current_mode
+                        overlay_active = False
+                        apply_mode_brightness(lcd, mode_manager.state.current_mode)
+                        if mode_manager.state.current_mode == Mode.LOCKED:
+                            theme = load_system_theme()
+                            last_theme_fingerprint = theme.get("fingerprint", "")
+                            last_theme_check_at = current_time
+                            refresh_full_frame(lcd, render_locked_mode(now, theme))
+                            last_second = now.strftime("%H:%M:%S")
+                            last_soft_nudge_at = current_time
+                            last_mode_detection_time = current_time
+                            continue
+                        if mode_manager.state.current_mode == Mode.MAIN and previous == Mode.LOCKED:
+                            theme = load_system_theme()
+                            last_theme_fingerprint = theme.get("fingerprint", "")
+                            last_theme_check_at = current_time
+                            refresh_full_frame(lcd, render_dashboard(now, last_notification))
+                            last_second = now.strftime("%H:%M:%S")
+                            last_date = now.strftime("%Y-%m-%d")
+                            last_minute = now.strftime("%H:%M")
+                            last_soft_nudge_at = current_time
+                            last_mode_detection_time = 0.0  # re-evaluate game/media ASAP
+                            continue
+
+                # --- Mode detection (periodic, paused during notification overlay / lock) ---
+                if (
+                    not overlay_active
+                    and mode_manager.state.current_mode != Mode.LOCKED
+                    and current_time - last_mode_detection_time >= DETECTION_INTERVAL
+                ):
+                    previous = mode_manager.state.current_mode
+                    mode_manager.detect_and_switch()
+                    last_mode_detection_time = current_time
+                    if mode_manager.state.current_mode != previous:
+                        mode_render_time = 0.0
+                        last_second = None
+                        last_date = None
+                        last_minute = None
+                        last_track_key = ""
+                        last_mode = mode_manager.state.current_mode
+                        overlay_active = False
+                        apply_mode_brightness(lcd, mode_manager.state.current_mode)
+                        if mode_manager.state.current_mode == Mode.MAIN:
+                            theme = load_system_theme()
+                            last_theme_fingerprint = theme.get("fingerprint", "")
+                            last_theme_check_at = current_time
+                            refresh_full_frame(lcd, render_dashboard(now, last_notification))
+                            last_second = now.strftime("%H:%M:%S")
+                            last_date = now.strftime("%Y-%m-%d")
+                            last_minute = now.strftime("%H:%M")
+                            last_soft_nudge_at = current_time
+                            continue
+                        last_soft_nudge_at = current_time
+
+                # --- Notifications: never show overlays while LOCKED ---
+                if mode_manager.state.current_mode == Mode.LOCKED:
+                    drained = None
+                    try:
+                        while True:
+                            drained = notification_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    if drained is not None:
+                        last_notification = drained
+                    if overlay_active:
+                        overlay_active = False
+                        refresh_full_frame(lcd, render_locked_mode(now, load_system_theme()))
+                        last_second = now.strftime("%H:%M:%S")
+                        last_soft_nudge_at = current_time
+                else:
+                    try:
+                        item = notification_queue.get_nowait()
+                        while True:
+                            item = notification_queue.get_nowait()
+                    except queue.Empty:
+                        if "item" in locals():
+                            last_notification = item
+                            display_image(lcd, render_notification(item, now))
+                            overlay_until = time.monotonic() + NOTIFICATION_SECONDS
+                            overlay_active = True
+                            del item
+
+                if overlay_active:
+                    if mode_manager.state.current_mode == Mode.LOCKED:
+                        overlay_active = False
+                        refresh_full_frame(lcd, render_locked_mode(now, load_system_theme()))
+                        last_second = now.strftime("%H:%M:%S")
+                        continue
+                    if time.monotonic() >= overlay_until:
+                        redraw_current_mode(lcd, mode_manager, now, last_notification)
+                        overlay_active = False
+                        mode_render_time = 0.0
+                        last_second = now.strftime("%H:%M:%S")
                         last_date = now.strftime("%Y-%m-%d")
                         last_minute = now.strftime("%H:%M")
-                        last_second = now.strftime("%H:%M:%S")
+                    time.sleep(0.05)
+                    continue
 
-            # Watchdog: screen went dark / serial silent without raising
-            if needs_watchdog_recovery():
-                raise serial.SerialException(
-                    f"watchdog: no successful frame for {WATCHDOG_SECONDS}s"
-                )
+                # Clear dashboard notification area after retention idle
+                if last_notification is not None:
+                    age = (now - last_notification.received_at).total_seconds()
+                    if age >= NOTIFICATION_RETENTION_SECONDS:
+                        logger.info("Clearing notification area after %.0f min idle", age / 60)
+                        last_notification = None
+                        if mode_manager.state.current_mode == Mode.MAIN:
+                            refresh_full_frame(lcd, render_dashboard(now, None))
+                            last_date = now.strftime("%Y-%m-%d")
+                            last_minute = now.strftime("%H:%M")
+                            last_second = now.strftime("%H:%M:%S")
 
-            # Periodic soft nudge: wakes a blank panel even when writes "succeed"
-            if current_time - last_soft_nudge_at >= SOFT_NUDGE_SECONDS:
-                last_soft_nudge_at = current_time
-                logger.info("Periodic soft nudge (brightness + redraw)")
+                # Watchdog: screen went dark / serial silent without raising
+                if needs_watchdog_recovery():
+                    raise serial.SerialException(
+                        f"watchdog: no successful frame for {WATCHDOG_SECONDS}s"
+                    )
+
+                # Periodic soft nudge: wakes a blank panel even when writes "succeed"
+                if current_time - last_soft_nudge_at >= SOFT_NUDGE_SECONDS:
+                    last_soft_nudge_at = current_time
+                    logger.info("Periodic soft nudge (brightness + redraw)")
+                    try:
+                        lcd._wake_panel()
+                        redraw_current_mode(lcd, mode_manager, now, last_notification)
+                    except (serial.SerialException, OSError) as nudge_exc:
+                        raise serial.SerialException(f"nudge failed: {nudge_exc}") from nudge_exc
+
+                # --- Render based on current mode ---
                 try:
-                    lcd._wake_panel()
-                    redraw_current_mode(lcd, mode_manager, now, last_notification)
-                except (serial.SerialException, OSError) as nudge_exc:
-                    raise serial.SerialException(f"nudge failed: {nudge_exc}") from nudge_exc
+                    if mode_manager.state.current_mode == Mode.MAIN:
+                        # MAIN mode: clock + notifications (with partial refresh optimization)
+                        current_second = now.strftime("%H:%M:%S")
+                        current_date = now.strftime("%Y-%m-%d")
+                        current_minute = now.strftime("%H:%M")
+                        if current_second != last_second:
+                            updated = render_dashboard(now, last_notification)
+                            x1, y1, x2, y2 = MAIN_CLOCK_CROP
+                            display_image(lcd, updated.crop((x1, y1, x2, y2)), x1, y1)
+                            last_second = current_second
+                        if current_date != last_date or current_minute != last_minute:
+                            refresh_full_frame(lcd, render_dashboard(now, last_notification))
+                            last_date = current_date
+                            last_minute = current_minute
 
-            # --- Render based on current mode ---
-            try:
-                if mode_manager.state.current_mode == Mode.MAIN:
-                    # MAIN mode: clock + notifications (with partial refresh optimization)
-                    current_second = now.strftime("%H:%M:%S")
-                    current_date = now.strftime("%Y-%m-%d")
-                    current_minute = now.strftime("%H:%M")
-                    if current_second != last_second:
-                        updated = render_dashboard(now, last_notification)
-                        x1, y1, x2, y2 = MAIN_CLOCK_CROP
-                        display_image(lcd, updated.crop((x1, y1, x2, y2)), x1, y1)
-                        last_second = current_second
-                    if current_date != last_date or current_minute != last_minute:
-                        refresh_full_frame(lcd, render_dashboard(now, last_notification))
-                        last_date = current_date
-                        last_minute = current_minute
-
-                elif mode_manager.state.current_mode == Mode.MULTIMEDIA:
-                    # Avoid hammering Rev A with full frames + MPRIS every second
-                    media = mode_manager.state.multimedia
-                    track_key = f"{media.title}|{media.artist}|{media.app_name}"
-                    due = current_time - mode_render_time >= MODE_CACHE_TTL
-                    track_changed = track_key != last_track_key
-                    if due or track_changed or mode_render_time == 0.0:
-                        mode_manager.state.multimedia = mode_manager.multimedia_detector.detect()
+                    elif mode_manager.state.current_mode == Mode.MULTIMEDIA:
+                        # Avoid hammering Rev A with full frames + MPRIS every second
                         media = mode_manager.state.multimedia
                         track_key = f"{media.title}|{media.artist}|{media.app_name}"
-                        mode_render_cache = render_multimedia_mode(media, now)
-                        mode_render_time = current_time
-                        last_track_key = track_key
-                        display_image(lcd, mode_render_cache)
-                    elif media.is_playing and media.length > 0:
-                        media.position = min(media.length, media.position + 0.2)
+                        due = current_time - mode_render_time >= MODE_CACHE_TTL
+                        track_changed = track_key != last_track_key
+                        if due or track_changed or mode_render_time == 0.0:
+                            mode_manager.state.multimedia = mode_manager.multimedia_detector.detect()
+                            media = mode_manager.state.multimedia
+                            track_key = f"{media.title}|{media.artist}|{media.app_name}"
+                            mode_render_cache = render_multimedia_mode(media, now)
+                            mode_render_time = current_time
+                            last_track_key = track_key
+                            display_image(lcd, mode_render_cache)
+                        elif media.is_playing and media.length > 0:
+                            media.position = min(media.length, media.position + 0.2)
 
-                elif mode_manager.state.current_mode == Mode.GAMER:
-                    if current_time - mode_render_time >= MODE_CACHE_TTL:
-                        mode_manager.state.gamer = mode_manager.gamer_detector.detect()
-                        mode_render_cache = render_gamer_mode(
-                            mode_manager.state.gamer, now
-                        )
-                        mode_render_time = current_time
-                        display_image(lcd, mode_render_cache)
-            except Exception as exc:
-                # Serial failures must use the recovery path below
-                if isinstance(exc, (serial.SerialException, OSError)):
-                    raise
-                logger.error("Mode render failed (%s); staying on current mode", exc)
-                time.sleep(0.5)
+                    elif mode_manager.state.current_mode == Mode.GAMER:
+                        if current_time - mode_render_time >= MODE_CACHE_TTL:
+                            mode_manager.state.gamer = mode_manager.gamer_detector.detect()
+                            mode_render_cache = render_gamer_mode(
+                                mode_manager.state.gamer, now
+                            )
+                            mode_render_time = current_time
+                            display_image(lcd, mode_render_cache)
 
-            time.sleep(0.05)
+                    elif mode_manager.state.current_mode == Mode.LOCKED:
+                        if current_time - last_theme_check_at >= THEME_WATCH_SECONDS:
+                            last_theme_check_at = current_time
+                            theme = load_system_theme()
+                            fp = theme.get("fingerprint", "")
+                            if fp and fp != last_theme_fingerprint:
+                                logger.info("Redrawing LOCKED after desktop environment change")
+                                last_theme_fingerprint = fp
+                                refresh_full_frame(lcd, render_locked_mode(now, theme))
+                                last_second = now.strftime("%H:%M:%S")
+                                continue
 
-        except (serial.SerialException, OSError) as exc:
-            overlay_active = False
-            last_second = None
-            last_date = None
-            last_minute = None
-            mode_render_cache = None
-            mode_render_time = 0.0
-            last_track_key = ""
-            recover_display(lcd, mode_manager, last_notification, str(exc))
+                        current_second = now.strftime("%H:%M:%S")
+                        if current_second != last_second:
+                            updated = render_locked_mode(now, load_system_theme())
+                            x1, y1, x2, y2 = LOCKED_CLOCK_CROP
+                            display_image(lcd, updated.crop((x1, y1, x2, y2)), x1, y1)
+                            last_second = current_second
+                except Exception as exc:
+                    # Serial failures must use the recovery path below
+                    if isinstance(exc, (serial.SerialException, OSError)):
+                        raise
+                    logger.error("Mode render failed (%s); staying on current mode", exc)
+                    time.sleep(0.5)
 
-finally:
-    if monitor_process and monitor_process.poll() is None:
-        monitor_process.terminate()
-    lcd.closeSerial()
+                time.sleep(0.05)
+
+            except (serial.SerialException, OSError) as exc:
+                overlay_active = False
+                last_second = None
+                last_date = None
+                last_minute = None
+                mode_render_cache = None
+                mode_render_time = 0.0
+                last_track_key = ""
+                recover_display(lcd, mode_manager, last_notification, str(exc))
+
+    finally:
+        if monitor_process and monitor_process.poll() is None:
+            monitor_process.terminate()
+        lcd.closeSerial()

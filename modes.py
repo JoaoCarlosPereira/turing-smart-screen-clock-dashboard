@@ -3,13 +3,16 @@
 Mode system for Turing Smart Screen.
 
 Manages multiple display modes: MAIN (clock/dashboard), MULTIMEDIA (media info),
-and GAMER (gaming overlay with FPS and hardware stats).
+GAMER (gaming overlay), and LOCKED (session lock — time + lock icon only).
 """
 
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -33,6 +36,14 @@ class Mode(Enum):
     MAIN = auto()
     MULTIMEDIA = auto()
     GAMER = auto()
+    LOCKED = auto()
+
+
+@dataclass
+class LockInfo:
+    """Session lock state for LOCKED mode."""
+    is_locked: bool = False
+    source: str = ""  # logind / gnome / freedesktop
 
 
 @dataclass
@@ -85,8 +96,20 @@ class ModeState:
     previous_mode: Mode = Mode.MAIN
     multimedia: MultimediaInfo = field(default_factory=MultimediaInfo)
     gamer: GamerInfo = field(default_factory=GamerInfo)
+    lock: LockInfo = field(default_factory=LockInfo)
     last_switch_time: float = 0.0
-    switch_cooldown: float = 3.0  # seconds before allowing another switch
+    switch_cooldown: float = 6.0  # seconds before allowing another switch
+    # Require consecutive hits/misses so flaky detection does not flap modes
+    game_hits: int = 0
+    game_misses: int = 0
+    media_hits: int = 0
+    media_misses: int = 0
+    lock_hits: int = 0
+    lock_misses: int = 0
+    enter_confirm: int = 2
+    leave_confirm: int = 2
+    lock_enter_confirm: int = 1  # lock/unlock should feel immediate
+    lock_leave_confirm: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +163,62 @@ NON_GAME_PROCESSES = {
     "srt-bwrap",
     "pv-adverb",
     "steamwebhelper_sniper_wrap.sh",
+}
+
+# Moonlight / Sunshine GameStream client process names (Linux + Windows)
+MOONLIGHT_PROCESS_NAMES = {
+    "moonlight",
+    "moonlight-qt",
+    "moonlight.exe",
+    "moonlight-qt.exe",
+}
+
+# NVIDIA GameStream / Sunshine ports used while a session is active
+GAMESTREAM_PORTS = {
+    47984, 47989, 47990, 47991, 47992, 47995, 47996, 47998, 47999, 48000, 48010,
+}
+
+_MOONLIGHT_SERVERINFO_CACHE: dict[str, tuple[float, Optional[str]]] = {}
+_MOONLIGHT_SERVERINFO_TTL = 8.0
+_MOONLIGHT_SERVERINFO_FAIL_TTL = 20.0
+_MOONLIGHT_HOSTS_CACHE: tuple[float, list[dict]] | None = None
+_MOONLIGHT_HOSTS_TTL = 30.0
+_MOONLIGHT_JOURNAL_APPID_CACHE: tuple[float, Optional[str]] | None = None
+_MOONLIGHT_JOURNAL_TTL = 10.0
+_MOONLIGHT_UNIQUEID = "0123456789ABCDEF"
+_HOST_GAME_HELPER_CACHE: tuple[float, Optional[dict]] | None = None
+_HOST_GAME_HELPER_TTL = 4.0
+_HOST_GAME_HELPER_FAIL_TTL = 12.0
+_HOST_GAME_HELPER_DEFAULT_PORT = 8787
+_HOST_GAME_HELPER_MULTICAST = "239.255.87.87"
+_HOST_GAME_HELPER_SERVICE = "turing-host-game"
+_HOST_GAME_UDP_CACHE: Optional[dict] = None
+_HOST_GAME_UDP_CACHE_MONO: float = 0.0
+_HOST_GAME_UDP_LOCK = threading.Lock()
+_HOST_GAME_UDP_THREAD: Optional[threading.Thread] = None
+
+_FOREGROUND_TITLE_IGNORE = {
+    "",
+    "program manager",
+    "windows input experience",
+    "windows shell experience host",
+    "search",
+    "searchhost",
+    "start",
+    "task switching",
+    "nvidia geforce overlay",
+    "nvidia share",
+    "game bar",
+    "xbox game bar",
+    "moonlight",
+    "steam",
+    "steam big picture mode",
+    "sunshine",
+    "windows powershell",
+    "windows terminal",
+    "command prompt",
+    "cmd.exe",
+    "c:\\windows\\system32\\cmd.exe",
 }
 
 # Well-known Steam AppIDs (useful for Remote Play when the game isn't installed locally)
@@ -308,6 +387,591 @@ def _extract_steam_appid(cmdline: list[str] | str) -> Optional[str]:
     if match:
         return match.group(1)
     return None
+
+
+def _moonlight_config_paths() -> list[Path]:
+    """Locate Moonlight.conf across native, Snap and Flatpak installs."""
+    home = Path.home()
+    candidates = [
+        home / "snap/moonlight/current/.config/Moonlight Game Streaming Project/Moonlight.conf",
+        home / ".config/Moonlight Game Streaming Project/Moonlight.conf",
+        home
+        / ".var/app/com.moonlight_stream.Moonlight/config/Moonlight Game Streaming Project/Moonlight.conf",
+    ]
+    snap_root = home / "snap" / "moonlight"
+    if snap_root.is_dir():
+        for path in sorted(
+            snap_root.glob("*/.config/Moonlight Game Streaming Project/Moonlight.conf"),
+            reverse=True,
+        ):
+            if path not in candidates:
+                candidates.append(path)
+    return [path for path in candidates if path.is_file()]
+
+
+def _parse_moonlight_hosts(conf_text: str) -> list[dict]:
+    """Parse Qt QSettings host/app entries from Moonlight.conf."""
+    hosts: dict[str, dict] = {}
+    for match in re.finditer(r"^(\d+)\\([^=]+)=(.*)$", conf_text, re.MULTILINE):
+        idx, key, value = match.group(1), match.group(2), match.group(3)
+        host = hosts.setdefault(idx, {"apps": {}})
+        if key.startswith("apps\\"):
+            parts = key.split("\\")
+            if len(parts) >= 3:
+                app = host["apps"].setdefault(parts[1], {})
+                app[parts[2]] = value
+            continue
+        host[key] = value
+
+    parsed: list[dict] = []
+    for host in hosts.values():
+        apps = []
+        for app in host.get("apps", {}).values():
+            name = (app.get("name") or "").strip()
+            if not name:
+                continue
+            apps.append({"id": str(app.get("id") or "").strip(), "name": name})
+        ips = []
+        for key in ("localaddress", "manualaddress", "remoteaddress"):
+            ip = (host.get(key) or "").strip()
+            if ip and ip not in ips:
+                ips.append(ip)
+        parsed.append(
+            {
+                "hostname": (host.get("hostname") or host.get("manualaddress") or "Moonlight").strip(),
+                "ips": ips,
+                "apps": apps,
+                "uuid": (host.get("uuid") or "").strip(),
+            }
+        )
+    return parsed
+
+
+def _moonlight_hosts() -> list[dict]:
+    """Cached list of paired Moonlight hosts and their apps."""
+    global _MOONLIGHT_HOSTS_CACHE
+    now = time.monotonic()
+    if _MOONLIGHT_HOSTS_CACHE and (now - _MOONLIGHT_HOSTS_CACHE[0]) < _MOONLIGHT_HOSTS_TTL:
+        return _MOONLIGHT_HOSTS_CACHE[1]
+
+    hosts: list[dict] = []
+    seen_uuids: set[str] = set()
+    for path in _moonlight_config_paths():
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for host in _parse_moonlight_hosts(text):
+            key = host.get("uuid") or f"{host.get('hostname')}|{','.join(host.get('ips') or [])}"
+            if key in seen_uuids:
+                continue
+            seen_uuids.add(key)
+            hosts.append(host)
+
+    _MOONLIGHT_HOSTS_CACHE = (now, hosts)
+    return hosts
+
+
+def _query_sunshine_current_game(ip: str) -> Optional[str]:
+    """Best-effort Sunshine currentgame id via the same HTTP probe Moonlight uses."""
+    ip = (ip or "").strip()
+    if not ip:
+        return None
+
+    now = time.monotonic()
+    cached = _MOONLIGHT_SERVERINFO_CACHE.get(ip)
+    if cached and (now - cached[0]) < (
+        _MOONLIGHT_SERVERINFO_TTL if cached[1] is not None else _MOONLIGHT_SERVERINFO_FAIL_TTL
+    ):
+        return cached[1]
+
+    current: Optional[str] = None
+    url = (
+        f"http://{ip}:47989/serverinfo"
+        f"?uniqueid={_MOONLIGHT_UNIQUEID}"
+    )
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=0.25) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+        match = re.search(r"<currentgame>(\d+)</currentgame>", text, re.IGNORECASE)
+        if match:
+            current = match.group(1)
+    except Exception:
+        current = None
+
+    _MOONLIGHT_SERVERINFO_CACHE[ip] = (now, current)
+    return current
+
+
+def _moonlight_last_launch_appid() -> Optional[str]:
+    """Read the latest Moonlight launch?appid=… from the user journal (cached)."""
+    global _MOONLIGHT_JOURNAL_APPID_CACHE
+    now = time.monotonic()
+    if _MOONLIGHT_JOURNAL_APPID_CACHE and (now - _MOONLIGHT_JOURNAL_APPID_CACHE[0]) < _MOONLIGHT_JOURNAL_TTL:
+        return _MOONLIGHT_JOURNAL_APPID_CACHE[1]
+
+    appid: Optional[str] = None
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "--user",
+                "_COMM=moonlight",
+                "-n",
+                "80",
+                "--no-pager",
+                "-o",
+                "cat",
+                "--since",
+                "2 hours ago",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=0.4,
+            check=False,
+        )
+        for line in reversed((result.stdout or "").splitlines()):
+            match = re.search(r"launch\?[^\"\s]*appid=(\d+)", line, re.IGNORECASE)
+            if match:
+                appid = match.group(1)
+                break
+    except (subprocess.SubprocessError, OSError, ValueError):
+        appid = None
+
+    _MOONLIGHT_JOURNAL_APPID_CACHE = (now, appid)
+    return appid
+
+
+def _preferred_moonlight_ips(hosts: list[dict]) -> list[str]:
+    """LAN addresses first; skip duplicate / empty values."""
+    local: list[str] = []
+    remote: list[str] = []
+    seen: set[str] = set()
+
+    def _is_lan(ip: str) -> bool:
+        if ip.startswith(("10.", "192.168.")):
+            return True
+        if ip.startswith("172."):
+            try:
+                second = int(ip.split(".", 2)[1])
+            except (IndexError, ValueError):
+                return False
+            return 16 <= second <= 31
+        return False
+
+    for host in hosts:
+        for ip in host.get("ips") or []:
+            if not ip or ip in seen:
+                continue
+            seen.add(ip)
+            (local if _is_lan(ip) else remote).append(ip)
+    return local + remote
+
+
+def _moonlight_app_name_from_hosts(hosts: list[dict], app_id: str) -> Optional[str]:
+    app_id = str(app_id or "").strip()
+    if not app_id or app_id == "0":
+        return None
+    for host in hosts:
+        for app in host.get("apps") or []:
+            if str(app.get("id") or "") == app_id:
+                return str(app.get("name") or "").strip() or None
+    return None
+
+
+def _moonlight_name_from_cmdline(cmdline: list[str]) -> Optional[str]:
+    """Parse `moonlight stream <host> <app>` style launches."""
+    if not cmdline:
+        return None
+    lowered = [str(part) for part in cmdline]
+    for idx, part in enumerate(lowered):
+        if part.lower() == "stream" and idx + 2 < len(lowered):
+            app = " ".join(lowered[idx + 2:]).strip().strip('"')
+            if app:
+                return app
+    joined = " ".join(lowered)
+    match = re.search(r"\bstream\s+\S+\s+(.+)$", joined, re.IGNORECASE)
+    if match:
+        app = match.group(1).strip().strip('"')
+        return app or None
+    return None
+
+
+def _is_moonlight_process(proc_name: str, cmdline: list[str], exe: str = "") -> bool:
+    stem = Path((proc_name or "").lower()).stem
+    if stem in MOONLIGHT_PROCESS_NAMES:
+        return True
+    exe_l = (exe or "").lower()
+    if "moonlight" in Path(exe_l).name:
+        return True
+    # Flatpak / snap wrappers sometimes expose a generic name with moonlight in argv0
+    if cmdline:
+        joined = " ".join(str(p) for p in cmdline[:3]).lower()
+        if re.search(r"(^|[/\s])moonlight(-qt)?(\s|$)", joined):
+            return True
+    return False
+
+
+def _proc_has_gamestream_traffic(proc, host_ips: set[str]) -> bool:
+    """True when Moonlight holds an active stream — games or Desktop remoto.
+
+    On Linux/Snap, stream UDP often appears as UNCONN without raddr. Treat
+    multiple non-mDNS UDP sockets bound to a unicast address as an active session.
+    """
+    try:
+        connections = proc.net_connections(kind="inet")
+    except (psutil.Error, PermissionError, OSError):
+        return False
+
+    stream_udp_ports = {47998, 47999, 48000, 48010}
+    control_ports = {47984, 47989, 47990, 47991}
+    unbound_stream_udp = 0
+
+    for conn in connections:
+        is_udp = int(getattr(conn, "type", 0)) == 2  # socket.SOCK_DGRAM
+        local = conn.laddr
+        lip = getattr(local, "ip", None) if local else None
+        lport = getattr(local, "port", None) if local else None
+        if local is not None and isinstance(local, tuple):
+            lip = local[0] if local else lip
+            lport = local[1] if len(local) > 1 else lport
+        try:
+            lport_i = int(lport) if lport is not None else -1
+        except (TypeError, ValueError):
+            lport_i = -1
+
+        remote = conn.raddr
+        rip = None
+        rport_i = -1
+        if remote:
+            rip = getattr(remote, "ip", None)
+            rport = getattr(remote, "port", None)
+            if rip is None and isinstance(remote, tuple):
+                rip = remote[0] if remote else None
+                rport = remote[1] if len(remote) > 1 else None
+            try:
+                rport_i = int(rport) if rport is not None else -1
+            except (TypeError, ValueError):
+                rport_i = -1
+
+        on_host = bool(host_ips) and bool(rip) and rip in host_ips
+
+        if is_udp and rip and (on_host or rport_i in stream_udp_ports):
+            return True
+
+        if (
+            conn.status == "ESTABLISHED"
+            and on_host
+            and (rport_i in GAMESTREAM_PORTS or rport_i in control_ports or 47980 <= rport_i <= 48020)
+        ):
+            return True
+
+        # Snap Moonlight: video/audio sockets bound to LAN IP, no raddr visible
+        if is_udp and lport_i not in (-1, 5353) and lip and lip not in ("0.0.0.0", "::", ""):
+            unbound_stream_udp += 1
+
+    return unbound_stream_udp >= 2
+
+
+def _format_moonlight_session_name(app_name: str, hostname: str = "") -> str:
+    """Human label for Moonlight sessions, including remote Desktop."""
+    raw = (app_name or "").strip() or "Moonlight"
+    host = (hostname or "").strip()
+    lowered = raw.lower()
+
+    desktop_aliases = {
+        "desktop",
+        "área de trabalho",
+        "area de trabalho",
+        "remote desktop",
+        "desktop remoto",
+    }
+    if lowered in desktop_aliases:
+        label = "Desktop remoto"
+    elif "big picture" in lowered:
+        label = "Steam Big Picture"
+    else:
+        label = raw
+
+    if host and host.lower() not in label.lower():
+        return f"{label} · {host}"
+    return label
+
+
+def _host_game_helper_base_urls(hosts: list[dict]) -> list[str]:
+    """Resolve optional HTTP helper URLs (fallback; primary path is UDP broadcast)."""
+    configured = ""
+    try:
+        from library.config import CONFIG_DATA
+
+        configured = str((CONFIG_DATA.get("config") or {}).get("HOST_GAME_HELPER_URL") or "").strip()
+    except Exception:
+        configured = ""
+
+    if configured and configured.upper() not in {"AUTO", "UDP", ""}:
+        return [configured.rstrip("/")]
+
+    urls: list[str] = []
+    for ip in _preferred_moonlight_ips(hosts):
+        urls.append(f"http://{ip}:{_HOST_GAME_HELPER_DEFAULT_PORT}")
+    return urls
+
+
+def _host_game_udp_payload_fresh(max_age: float = 5.0) -> Optional[dict]:
+    with _HOST_GAME_UDP_LOCK:
+        if not _HOST_GAME_UDP_CACHE:
+            return None
+        age = time.monotonic() - _HOST_GAME_UDP_CACHE_MONO
+        if age > max_age:
+            return None
+        return dict(_HOST_GAME_UDP_CACHE)
+
+
+def _accept_host_game_udp_payload(data: dict, source_ip: str = "") -> None:
+    global _HOST_GAME_UDP_CACHE, _HOST_GAME_UDP_CACHE_MONO, _HOST_GAME_HELPER_CACHE
+    if not isinstance(data, dict):
+        return
+    service = str(data.get("service") or "")
+    if service and service != _HOST_GAME_HELPER_SERVICE:
+        return
+    # Require at least a title or exe so empty keepalives do not clear state
+    if not (data.get("title") or data.get("exe")):
+        return
+    payload = {
+        "title": str(data.get("title") or ""),
+        "exe": str(data.get("exe") or ""),
+        "pid": int(data.get("pid") or 0),
+        "updated_at": float(data.get("updated_at") or time.time()),
+        "source_ip": source_ip,
+    }
+    with _HOST_GAME_UDP_LOCK:
+        _HOST_GAME_UDP_CACHE = payload
+        _HOST_GAME_UDP_CACHE_MONO = time.monotonic()
+    # Keep HTTP-style cache warm so resolve path stays sync/fast
+    _HOST_GAME_HELPER_CACHE = (time.monotonic(), payload)
+
+
+def _host_game_udp_loop(port: int) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", port))
+    except OSError as exc:
+        logger.debug("Host game UDP listener bind failed on %s: %s", port, exc)
+        sock.close()
+        return
+
+    try:
+        mreq = struct.pack("=4s4s", socket.inet_aton(_HOST_GAME_HELPER_MULTICAST), socket.inet_aton("0.0.0.0"))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError as exc:
+        logger.debug("Host game multicast join failed: %s", exc)
+
+    sock.settimeout(1.0)
+    logger.info(
+        "Listening for host game helper on UDP :%s (multicast %s)",
+        port,
+        _HOST_GAME_HELPER_MULTICAST,
+    )
+    while True:
+        try:
+            raw, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            data = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            continue
+        _accept_host_game_udp_payload(data, source_ip=addr[0] if addr else "")
+
+
+def _ensure_host_game_udp_listener() -> None:
+    global _HOST_GAME_UDP_THREAD
+    if _HOST_GAME_UDP_THREAD and _HOST_GAME_UDP_THREAD.is_alive():
+        return
+    thread = threading.Thread(
+        target=_host_game_udp_loop,
+        args=(_HOST_GAME_HELPER_DEFAULT_PORT,),
+        name="host-game-udp",
+        daemon=True,
+    )
+    _HOST_GAME_UDP_THREAD = thread
+    thread.start()
+
+
+def _query_host_game_helper(hosts: list[dict]) -> Optional[dict]:
+    """Foreground window from Windows helper — UDP broadcast first, HTTP fallback."""
+    global _HOST_GAME_HELPER_CACHE
+    _ensure_host_game_udp_listener()
+
+    udp_payload = _host_game_udp_payload_fresh(max_age=5.0)
+    if udp_payload:
+        return udp_payload
+
+    now = time.monotonic()
+    if _HOST_GAME_HELPER_CACHE is not None:
+        age = now - _HOST_GAME_HELPER_CACHE[0]
+        payload = _HOST_GAME_HELPER_CACHE[1]
+        ttl = _HOST_GAME_HELPER_TTL if payload is not None else _HOST_GAME_HELPER_FAIL_TTL
+        if age < ttl:
+            return payload
+
+    payload: Optional[dict] = None
+    for base in _host_game_helper_base_urls(hosts)[:2]:
+        url = f"{base.rstrip('/')}/foreground"
+        try:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=0.15) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+            if isinstance(data, dict) and (data.get("title") or data.get("exe")):
+                payload = {
+                    "title": str(data.get("title") or ""),
+                    "exe": str(data.get("exe") or ""),
+                    "pid": int(data.get("pid") or 0),
+                    "updated_at": float(data.get("updated_at") or time.time()),
+                }
+                break
+        except Exception:
+            continue
+
+    _HOST_GAME_HELPER_CACHE = (now, payload)
+    return payload
+
+
+def _clean_foreground_title(title: str, exe: str = "") -> str:
+    """Normalize a Windows foreground title into a usable game label."""
+    raw = " ".join((title or "").replace("\xa0", " ").split()).strip()
+    if not raw:
+        stem = Path((exe or "").replace("\\", "/")).stem
+        raw = stem.replace("_", " ").replace("-", " ").strip()
+    if not raw:
+        return ""
+
+    lowered = raw.lower()
+    if lowered in _FOREGROUND_TITLE_IGNORE:
+        return ""
+    if lowered.startswith("desktop remoto") or lowered == "desktop":
+        return ""
+
+    for sep in (" — ", " – ", " - ", " | "):
+        if sep in raw:
+            left = raw.split(sep, 1)[0].strip()
+            if len(left) >= 3 and left.lower() not in _FOREGROUND_TITLE_IGNORE:
+                raw = left
+                break
+
+    raw = re.sub(r"\s+\(\d+\s*[\-–—]?\s*bit\)$", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s+\[.*?\]$", "", raw).strip()
+    if raw.lower() in _FOREGROUND_TITLE_IGNORE:
+        return ""
+    return raw
+
+
+_BORING_FOREGROUND_STEMS = {
+    "cmd",
+    "powershell",
+    "pwsh",
+    "windowsterminal",
+    "conhost",
+    "openconsole",
+    "python",
+    "pythonw",
+    "explorer",
+    "sunshine",
+    "sunshinesvc",
+}
+
+
+def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
+    """Map helper title/exe to (display_name, steam_appid)."""
+    stem = Path((exe or "").replace("\\", "/")).stem.lower()
+    cleaned = _clean_foreground_title(title, exe)
+    if not cleaned:
+        return "", ""
+    if stem in _BORING_FOREGROUND_STEMS and cleaned.lower() in _FOREGROUND_TITLE_IGNORE:
+        return "", ""
+    if stem in _BORING_FOREGROUND_STEMS and not any(
+        key in cleaned.lower() for key in KNOWN_GAMES if len(key) >= 4
+    ):
+        # Ignore shell titles unless they somehow include a game name.
+        if cleaned.lower() in _FOREGROUND_TITLE_IGNORE or stem in cleaned.lower():
+            return "", ""
+
+    if stem in KNOWN_GAMES:
+        return KNOWN_GAMES[stem], KNOWN_GAME_APPIDS.get(stem, "")
+    if stem in KNOWN_GAME_APPIDS:
+        appid = KNOWN_GAME_APPIDS[stem]
+        return resolve_steam_app_name(appid), appid
+
+    needle = cleaned.lower()
+    for key, name in KNOWN_GAMES.items():
+        if len(key) < 4:
+            continue
+        if key in needle or name.lower() == needle or name.lower() in needle:
+            return name, KNOWN_GAME_APPIDS.get(key, "")
+
+    for appid, name in STEAM_APP_NAMES.items():
+        if name.lower() == needle or name.lower() in needle:
+            return name, appid
+
+    cache = _load_steam_name_cache()
+    for appid, name in cache.items():
+        if str(name).lower() == needle or str(name).lower() in needle:
+            return str(name), str(appid)
+
+    appid = _appid_for_process(stem or cleaned, cleaned)
+    if appid:
+        return resolve_steam_app_name(appid) or cleaned, appid
+    return cleaned, ""
+
+
+def _resolve_moonlight_display_name(proc, hosts: list[dict], cmdline: list[str]) -> str:
+    """Best-effort streamed app title for the GAMER overlay (game or Desktop)."""
+    return _resolve_moonlight_game_info(proc, hosts, cmdline)["display_name"]
+
+
+def _resolve_moonlight_game_info(proc, hosts: list[dict], cmdline: list[str]) -> dict:
+    """Resolve Moonlight session label + optional Steam appid (host helper first)."""
+    hostname = (hosts[0].get("hostname") if hosts else "") or ""
+
+    helper = _query_host_game_helper(hosts)
+    if helper:
+        display, appid = _match_game_from_foreground(
+            str(helper.get("title") or ""),
+            str(helper.get("exe") or ""),
+        )
+        if display:
+            return {"display_name": display, "appid": appid}
+
+    cmdline_name = _moonlight_name_from_cmdline(cmdline)
+    if cmdline_name:
+        name = _format_moonlight_session_name(cmdline_name, hostname)
+        return {"display_name": name, "appid": _appid_for_process("moonlight", cmdline_name)}
+
+    app_id = None
+    for ip in _preferred_moonlight_ips(hosts)[:1]:
+        app_id = _query_sunshine_current_game(ip)
+        if app_id and app_id != "0":
+            break
+        app_id = None
+    if not app_id:
+        app_id = _moonlight_last_launch_appid()
+
+    if app_id and app_id != "0":
+        mapped = _moonlight_app_name_from_hosts(hosts, app_id)
+        if mapped:
+            name = _format_moonlight_session_name(mapped, hostname)
+            return {"display_name": name, "appid": _appid_for_process("moonlight", mapped)}
+        name = _format_moonlight_session_name(f"App {app_id}", hostname)
+        return {"display_name": name, "appid": ""}
+
+    if hosts:
+        name = _format_moonlight_session_name("Moonlight", hostname)
+        return {"display_name": name, "appid": ""}
+    return {"display_name": "Moonlight", "appid": ""}
 
 
 def _appid_for_process(proc_name: str, display_name: str = "") -> str:
@@ -849,6 +1513,7 @@ class GamerDetector:
         self._session_key: str = ""
         self._session_started_at: Optional[datetime] = None
         self._last_seen_mono: float = 0.0
+        _ensure_host_game_udp_listener()
 
     def detect(self) -> GamerInfo:
         """Check if a game is running and gather metrics."""
@@ -865,11 +1530,21 @@ class GamerDetector:
 
             session_key = f"{info.steam_appid}:{info.game_name}"
             proc_started = self._process_start_time(info.process_pid)
+            # Moonlight / Steam Remote Play stay open for hours in the tray.
+            # Playtime must count the *detected session*, not process uptime.
+            stream_client = self._is_stream_client_process(info.process_name)
             if session_key != self._session_key or self._session_started_at is None:
                 self._session_key = session_key
-                self._session_started_at = proc_started or datetime.now().astimezone()
-            elif proc_started and proc_started < self._session_started_at:
-                # Prefer earlier process start (e.g. reaper launched before client)
+                if stream_client:
+                    self._session_started_at = datetime.now().astimezone()
+                else:
+                    self._session_started_at = proc_started or datetime.now().astimezone()
+            elif (
+                not stream_client
+                and proc_started
+                and proc_started < self._session_started_at
+            ):
+                # Local games: prefer earlier process start (reaper before client).
                 self._session_started_at = proc_started
 
             info.detected_at = self._session_started_at
@@ -918,49 +1593,96 @@ class GamerDetector:
         except (psutil.Error, ValueError, OSError):
             return None
 
+    @staticmethod
+    def _is_stream_client_process(process_name: str) -> bool:
+        stem = Path((process_name or "").lower()).stem
+        if stem in MOONLIGHT_PROCESS_NAMES or "moonlight" in stem:
+            return True
+        return stem in {"streaming_client", "reaper"}
+
     def refresh_metrics(self, info: GamerInfo) -> GamerInfo:
         """Update CPU/GPU usage and temperatures on an existing GamerInfo."""
         self._gather_gamer_metrics(info)
         return info
 
     def _detect_game(self) -> Optional[dict]:
-        """Detect a running local game or Steam Remote Play stream."""
+        """Detect a running local game, Steam Remote Play, or Moonlight stream."""
+        # Cheap attrs first — cmdline/exe are expensive across all processes.
         try:
-            procs = list(psutil.process_iter(["name", "pid", "ppid", "cmdline"]))
+            procs = list(psutil.process_iter(["name", "pid", "ppid"]))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return None
 
         stream_hit = None
         known_hit = None
+        moonlight_hit = None
+        moonlight_hosts = None
+        moonlight_ips = None
 
         for proc in procs:
             proc_name = proc.info.get("name") or ""
             proc_lower = proc_name.lower()
             pid = proc.info.get("pid")
             ppid = proc.info.get("ppid")
-            cmdline = proc.info.get("cmdline") or []
 
             if not proc_lower or pid < 200 or ppid in (0, 2):
                 continue
             if proc_lower in NON_GAME_PROCESSES or Path(proc_lower).stem in NON_GAME_PROCESSES:
                 continue
 
-            # Steam Remote Play / in-home streaming — game runs on another PC
-            if proc_lower in {"streaming_client", "reaper"} or "streaming_client" in " ".join(cmdline):
-                appid = _extract_steam_appid(cmdline)
-                if appid:
-                    stream_hit = {
-                        "process": proc_name,
-                        "display_name": resolve_steam_app_name(appid),
-                        "pid": pid,
-                        "appid": appid,
+            stem = Path(proc_lower).stem
+
+            # Moonlight — resolve cmdline/exe/sockets only for matching processes
+            if stem in MOONLIGHT_PROCESS_NAMES or "moonlight" in stem:
+                try:
+                    cmdline = proc.cmdline() or []
+                    exe = proc.exe() or ""
+                except (psutil.Error, PermissionError, OSError):
+                    cmdline, exe = [], ""
+                if not _is_moonlight_process(proc_name, cmdline, exe):
+                    continue
+                if moonlight_hosts is None:
+                    moonlight_hosts = _moonlight_hosts()
+                    moonlight_ips = {
+                        ip
+                        for host in moonlight_hosts
+                        for ip in (host.get("ips") or [])
+                        if ip
                     }
-                    # Prefer streaming_client over reaper wrapper
-                    if proc_lower == "streaming_client":
-                        return stream_hit
+                if _proc_has_gamestream_traffic(proc, moonlight_ips or set()):
+                    game_info = _resolve_moonlight_game_info(
+                        proc, moonlight_hosts or [], cmdline
+                    )
+                    moonlight_hit = {
+                        "process": proc_name,
+                        "display_name": game_info["display_name"],
+                        "pid": pid,
+                        "appid": game_info.get("appid")
+                        or _appid_for_process(proc_name, game_info["display_name"]),
+                    }
                 continue
 
-            stem = Path(proc_lower).stem
+            # Steam Remote Play — need cmdline only for these names
+            if stem in {"streaming_client", "reaper"}:
+                try:
+                    cmdline = proc.cmdline() or []
+                except (psutil.Error, PermissionError, OSError):
+                    cmdline = []
+                if stem == "reaper" and "streaming_client" not in " ".join(cmdline):
+                    pass  # fall through to normal game checks
+                else:
+                    appid = _extract_steam_appid(cmdline)
+                    if appid:
+                        stream_hit = {
+                            "process": proc_name,
+                            "display_name": resolve_steam_app_name(appid),
+                            "pid": pid,
+                            "appid": appid,
+                        }
+                        if stem == "streaming_client":
+                            return stream_hit
+                        continue
+
             if stem in KNOWN_GAMES:
                 known_hit = {
                     "process": proc_name,
@@ -996,7 +1718,11 @@ class GamerDetector:
             known_hit["appid"] = _appid_for_process(known_hit["process"], known_hit["display_name"])
         if stream_hit and not stream_hit.get("appid"):
             stream_hit["appid"] = _appid_for_process(stream_hit["process"], stream_hit["display_name"])
-        return known_hit or stream_hit
+        if moonlight_hit and not moonlight_hit.get("appid"):
+            moonlight_hit["appid"] = _appid_for_process(
+                moonlight_hit["process"], moonlight_hit["display_name"]
+            )
+        return known_hit or stream_hit or moonlight_hit
 
     def _gather_gamer_metrics(self, info: GamerInfo, pid: Optional[int] = None):
         """Gather system-wide CPU/GPU usage and temperatures."""
@@ -1096,6 +1822,172 @@ class GamerDetector:
             pass
 
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Session lock detection (logind / GNOME / freedesktop ScreenSaver)
+# ---------------------------------------------------------------------------
+
+class LockDetector:
+    """Detect whether the graphical session is locked."""
+
+    def __init__(self):
+        self._last_info = LockInfo()
+
+    def detect(self) -> LockInfo:
+        """Return current lock state (best-effort across desktop environments)."""
+        for checker, source in (
+            (self._locked_via_logind, "logind"),
+            (self._locked_via_gnome_screensaver, "gnome"),
+            (self._locked_via_freedesktop_screensaver, "freedesktop"),
+        ):
+            try:
+                result = checker()
+            except Exception as exc:
+                logger.debug("Lock check via %s failed: %s", source, exc)
+                continue
+            if result is None:
+                continue
+            info = LockInfo(is_locked=bool(result), source=source)
+            self._last_info = info
+            return info
+        return self._last_info
+
+    def is_locked(self) -> bool:
+        return bool(self.detect().is_locked)
+
+    @staticmethod
+    def _parse_busctl_bool(stdout: str) -> Optional[bool]:
+        text = (stdout or "").strip().lower()
+        if not text:
+            return None
+        # busctl: "b true" / "b false"  |  method call: "b true"
+        if "true" in text or text.endswith("1"):
+            return True
+        if "false" in text or text.endswith("0"):
+            return False
+        return None
+
+    def _locked_via_logind(self) -> Optional[bool]:
+        """Prefer systemd-logind LockedHint on the caller's / graphical session."""
+        # Fast path: session/auto resolves to the calling process session
+        try:
+            result = subprocess.run(
+                [
+                    "busctl",
+                    "get-property",
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1/session/auto",
+                    "org.freedesktop.login1.Session",
+                    "LockedHint",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if result.returncode == 0:
+                parsed = self._parse_busctl_bool(result.stdout)
+                if parsed is not None:
+                    return parsed
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        # Fallback: any active local graphical session
+        try:
+            listed = subprocess.run(
+                ["loginctl", "list-sessions", "--no-legend"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if listed.returncode != 0:
+                return None
+            for line in listed.stdout.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                session_id = parts[0]
+                props = subprocess.run(
+                    [
+                        "loginctl",
+                        "show-session",
+                        session_id,
+                        "-p",
+                        "LockedHint",
+                        "-p",
+                        "Type",
+                        "-p",
+                        "State",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                if props.returncode != 0:
+                    continue
+                values = {}
+                for prop_line in props.stdout.splitlines():
+                    if "=" in prop_line:
+                        key, val = prop_line.split("=", 1)
+                        values[key.strip()] = val.strip()
+                session_type = (values.get("Type") or "").lower()
+                state = (values.get("State") or "").lower()
+                if session_type not in ("wayland", "x11", "mir", "tty"):
+                    continue
+                if state not in ("active", "online"):
+                    continue
+                hint = (values.get("LockedHint") or "").lower()
+                if hint in ("yes", "true", "1"):
+                    return True
+                if hint in ("no", "false", "0"):
+                    return False
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return None
+        return None
+
+    def _locked_via_gnome_screensaver(self) -> Optional[bool]:
+        try:
+            result = subprocess.run(
+                [
+                    "busctl",
+                    "--user",
+                    "call",
+                    "org.gnome.ScreenSaver",
+                    "/org/gnome/ScreenSaver",
+                    "org.gnome.ScreenSaver",
+                    "GetActive",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if result.returncode != 0:
+                return None
+            return self._parse_busctl_bool(result.stdout)
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+    def _locked_via_freedesktop_screensaver(self) -> Optional[bool]:
+        try:
+            result = subprocess.run(
+                [
+                    "busctl",
+                    "--user",
+                    "call",
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    "org.freedesktop.ScreenSaver",
+                    "GetActive",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if result.returncode != 0:
+                return None
+            return self._parse_busctl_bool(result.stdout)
+        except (subprocess.SubprocessError, OSError):
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +2304,120 @@ def render_gamer_mode(info: GamerInfo, now: datetime) -> object:
     return image_rgb
 
 
+def _draw_lock_icon(draw, cx: int, cy: int, color: tuple, scale: float = 1.0):
+    """Draw a simple padlock centered at (cx, cy)."""
+    s = scale
+    # Shackle
+    left = int(cx - 22 * s)
+    right = int(cx + 22 * s)
+    top = int(cy - 48 * s)
+    mid = int(cy - 18 * s)
+    draw.arc((left, top, right, mid + int(22 * s)), start=180, end=0, fill=color, width=max(3, int(5 * s)))
+    # Body
+    body = (
+        int(cx - 28 * s),
+        int(cy - 14 * s),
+        int(cx + 28 * s),
+        int(cy + 36 * s),
+    )
+    draw.rounded_rectangle(body, radius=max(4, int(8 * s)), outline=color, width=max(2, int(4 * s)))
+    draw.rounded_rectangle(
+        (
+            body[0] + int(6 * s),
+            body[1] + int(6 * s),
+            body[2] - int(6 * s),
+            body[3] - int(6 * s),
+        ),
+        radius=max(3, int(6 * s)),
+        fill=color,
+    )
+    # Keyhole
+    kh_color = (12, 14, 18)
+    draw.ellipse(
+        (int(cx - 6 * s), int(cy - 2 * s), int(cx + 6 * s), int(cy + 10 * s)),
+        fill=kh_color,
+    )
+    draw.polygon(
+        [
+            (int(cx - 3 * s), int(cy + 8 * s)),
+            (int(cx + 3 * s), int(cy + 8 * s)),
+            (int(cx + 2 * s), int(cy + 22 * s)),
+            (int(cx - 2 * s), int(cy + 22 * s)),
+        ],
+        fill=kh_color,
+    )
+
+
+def render_locked_mode(now: datetime, theme: Optional[dict] = None) -> object:
+    """Minimal lock screen: OS-themed backdrop, lock icon, time only."""
+    from PIL import Image, ImageDraw, ImageEnhance
+
+    theme = theme or {}
+    accent = tuple(theme.get("accent") or _CYAN)
+    accent2 = tuple(theme.get("accent2") or _BLUE)
+    wallpaper = theme.get("wallpaper")
+    ar, ag, ab = accent
+
+    if wallpaper is not None:
+        backdrop = _cover_fit(wallpaper.convert("RGB"), (_WIDTH, _HEIGHT))
+        # Darker than MAIN — panel brightness also drops to 10%
+        backdrop = ImageEnhance.Brightness(backdrop).enhance(0.42)
+        backdrop = ImageEnhance.Contrast(backdrop).enhance(1.05)
+        backdrop = ImageEnhance.Color(backdrop).enhance(0.85)
+        image = backdrop.convert("RGBA")
+    else:
+        image = Image.new("RGBA", (_WIDTH, _HEIGHT), (*_BG, 255))
+
+    wash = Image.new("RGBA", (_WIDTH, _HEIGHT), (0, 0, 0, 0))
+    wash_draw = ImageDraw.Draw(wash)
+    wash_draw.rectangle((0, 0, _WIDTH, 6), fill=(ar, ag, ab, 100))
+    # Soft vignette + center scrim so the clock stays readable
+    for y in range(_HEIGHT):
+        edge = min(y, _HEIGHT - 1 - y) / max(1, _HEIGHT // 2)
+        alpha = int(40 + 90 * (1.0 - edge))
+        wash_draw.line((0, y, _WIDTH, y), fill=(4, 6, 10, alpha))
+    wash_draw.rounded_rectangle(
+        (40, 36, _WIDTH - 40, _HEIGHT - 36),
+        radius=20,
+        fill=(0, 0, 0, 120),
+    )
+    image = Image.alpha_composite(image, wash)
+
+    image_rgb = image.convert("RGB")
+    draw = ImageDraw.Draw(image_rgb)
+    draw.rectangle((0, 0, _WIDTH - 1, _HEIGHT - 1), outline=accent, width=3)
+
+    # Lock icon
+    _draw_lock_icon(draw, _WIDTH // 2, 88, accent, scale=1.15)
+
+    # Time only (large, centered)
+    clock = now.strftime("%H:%M:%S")
+    draw.text(
+        (_WIDTH // 2 + 2, 188),
+        clock,
+        font=_font(_FONT_MONO, 72),
+        fill=(0, 0, 0),
+        anchor="mm",
+    )
+    draw.text(
+        (_WIDTH // 2, 186),
+        clock,
+        font=_font(_FONT_MONO, 72),
+        fill=_WHITE,
+        anchor="mm",
+    )
+
+    draw.text(
+        (_WIDTH // 2, 248),
+        "BLOQUEADO",
+        font=_font(_FONT_MONO, 18),
+        fill=accent2,
+        anchor="mm",
+    )
+
+    return image_rgb
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -1479,10 +2485,16 @@ class ModeManager:
         self.state = ModeState()
         self.multimedia_detector = MultimediaDetector()
         self.gamer_detector = GamerDetector()
+        self.lock_detector = LockDetector()
         self._forced = False
 
         if config_mode:
-            mode_map = {"main": Mode.MAIN, "multimedia": Mode.MULTIMEDIA, "gamer": Mode.GAMER}
+            mode_map = {
+                "main": Mode.MAIN,
+                "multimedia": Mode.MULTIMEDIA,
+                "gamer": Mode.GAMER,
+                "locked": Mode.LOCKED,
+            }
             self.state.current_mode = mode_map.get(config_mode.lower(), Mode.MAIN)
             self._forced = True
             logger.info("Mode set to: %s (from config)", self.state.current_mode.name)
@@ -1494,37 +2506,111 @@ class ModeManager:
             return lambda: render_multimedia_mode(self.state.multimedia, datetime.now())
         if self.state.current_mode == Mode.GAMER:
             return lambda: render_gamer_mode(self.state.gamer, datetime.now())
+        if self.state.current_mode == Mode.LOCKED:
+            return lambda: render_locked_mode(datetime.now())
         return None
 
-    def detect_and_switch(self):
-        """Auto-detect the appropriate mode and switch if needed."""
+    def poll_lock(self) -> bool:
+        """Lightweight lock poll (call more often than full detect_and_switch).
+
+        Returns True when the active mode changed because of lock/unlock.
+        """
         if self._forced:
+            return False
+
+        previous = self.state.current_mode
+        lock_info = None
+        try:
+            lock_info = self.lock_detector.detect()
+        except Exception as exc:
+            logger.debug("Lock detection failed: %s", exc)
+            return False
+
+        if lock_info and lock_info.is_locked:
+            self.state.lock_hits += 1
+            self.state.lock_misses = 0
+            self.state.lock = lock_info
+            if self.state.current_mode != Mode.LOCKED:
+                if self.state.lock_hits >= self.state.lock_enter_confirm:
+                    self._switch_mode(Mode.LOCKED)
+            return self.state.current_mode != previous
+
+        self.state.lock_hits = 0
+        if self.state.current_mode == Mode.LOCKED:
+            self.state.lock_misses += 1
+            if self.state.lock_misses < self.state.lock_leave_confirm:
+                return False
+            self.state.lock_misses = 0
+            self.state.lock = LockInfo(
+                is_locked=False,
+                source=lock_info.source if lock_info else "",
+            )
+            # Leave LOCKED immediately; full detect_and_switch picks game/media next
+            self._switch_mode(Mode.MAIN)
+            self.state.last_switch_time = 0.0
+            return True
+        return False
+
+    def detect_and_switch(self):
+        """Auto-detect the appropriate mode and switch if needed.
+
+        Priority: LOCKED > GAMER > MULTIMEDIA > MAIN
+        """
+        if self._forced:
+            return
+
+        # Lock handled by poll_lock() on a faster cadence — skip if already locked
+        if self.state.current_mode == Mode.LOCKED:
             return
 
         now = time.monotonic()
         if now - self.state.last_switch_time < self.state.switch_cooldown:
             return
 
+        game_info = None
         try:
             game_info = self.gamer_detector.detect()
-            if game_info.game_name:
-                if self.state.current_mode != Mode.GAMER:
-                    self._switch_mode(Mode.GAMER)
-                self.state.gamer = game_info
-                return
         except Exception as exc:
             logger.debug("Game detection failed: %s", exc)
 
+        if game_info and game_info.game_name:
+            self.state.game_hits += 1
+            self.state.game_misses = 0
+            self.state.media_hits = 0
+            self.state.gamer = game_info
+            if self.state.current_mode != Mode.GAMER:
+                if self.state.game_hits >= self.state.enter_confirm:
+                    self._switch_mode(Mode.GAMER)
+            return
+
+        self.state.game_hits = 0
+        if self.state.current_mode == Mode.GAMER:
+            self.state.game_misses += 1
+            if self.state.game_misses < self.state.leave_confirm:
+                return
+            self.state.game_misses = 0
+
+        media_info = None
         try:
             media_info = self.multimedia_detector.detect()
-            # Only switch when media is actually playing
-            if media_info.is_playing and media_info.title:
-                if self.state.current_mode != Mode.MULTIMEDIA:
-                    self._switch_mode(Mode.MULTIMEDIA)
-                self.state.multimedia = media_info
-                return
         except Exception as exc:
             logger.debug("Multimedia detection failed: %s", exc)
+
+        if media_info and media_info.is_playing and media_info.title:
+            self.state.media_hits += 1
+            self.state.media_misses = 0
+            self.state.multimedia = media_info
+            if self.state.current_mode != Mode.MULTIMEDIA:
+                if self.state.media_hits >= self.state.enter_confirm:
+                    self._switch_mode(Mode.MULTIMEDIA)
+            return
+
+        self.state.media_hits = 0
+        if self.state.current_mode == Mode.MULTIMEDIA:
+            self.state.media_misses += 1
+            if self.state.media_misses < self.state.leave_confirm:
+                return
+            self.state.media_misses = 0
 
         if self.state.current_mode != Mode.MAIN:
             self._switch_mode(Mode.MAIN)

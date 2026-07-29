@@ -47,35 +47,48 @@ No Ubuntu/Pop!_OS:
 
 ```bash
 sudo apt install python3-venv
-cd /mnt/dados/dsv/turing-smart-screen-python
+cd /mnt/Dados/dsv/turing-smart-screen-python
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-clock.txt
 ```
 
 ## Modos de exibição
 
-O `clock-display.py` suporta três modos de exibição com detecção automática:
+O `clock-display.py` suporta quatro modos de exibição com detecção automática:
 
-### 1. MAIN (padrão) — Painel de relógio e notificações
+### 1. MAIN (padrão) — Painel de relógio, clima e notificações
 
-Exibe a hora local, data e notificações do desktop. É o modo original do
-programa.
+Exibe a hora local, data, previsão do tempo (Open-Meteo, local fixo SMO/SC
+nos coords — **sem rótulo de local nem fonte na UI**) e notificações do desktop.
+Sem notificação ativa, a área inferior mostra temperatura grande + condição,
+meta compacta (máx·mín / **chuva restante do dia**·umidade·vento) e uma **timeline horária de chuva**
+(12 barras de 2h: 00·02·…·22, marcador do bloco atual).
+O % de **Chuva** é o máximo diário escalado pela massa de probabilidade das horas
+ainda à frente (hora atual inclusive) — ex.: dia 100% e 70% do “peso” já passou → ~30%.
+Com notificação, o alerta ocupa essa área (retenção de **15 minutos** no painel).
+O painel da hora é compacto (data sem ano + dia da semana elevado) para dar mais
+espaço ao clima/notificações.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ ██████████████████████████████████████████████████████████████████  │
 │                                                                     │
-│   15:20:33                  22 Jul 2026                            │
-│                       Wednesday                                  │
-│                                                                     │
+│   15:20:33                      22 JUL                             │
+│                                 2026                               │
+│                                 WEDNESDAY                          │
+│  ─────────────────────────────────────────────────────────────────  │
 │  ┌───────────────────────────────────────────────────────────────┐ │
-│  │                                                               │ │
-│  │    ♪    Nenhuma notificação                    15:20         │ │
-│  │                                                               │ │
+│  │  ☀  24°                                   Céu limpo         │ │
+│  │      máx 25° · mín 16°          Chuva 40% · Um 69% · 3 km/h  │ │
+│  │  Chuva                                                        │ │
+│  │  ▁▂▃▅▇█▅▃▂▁▁▁▂▃▄▅▆▅▃▂▁▁▁▁   (0h  6h  12h  18h)              │ │
 │  └───────────────────────────────────────────────────────────────┘ │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Fonte do clima (só no backend): [Open-Meteo](https://open-meteo.com/) (sem API
+key), coords SMO/SC, hourly `precipitation_probability`, cache ~12 minutos.
+UI do clima **não** exibe local nem atribuição.
 
 ### 2. MULTIMEDIA — Info de mídia (estilo Spotify)
 
@@ -134,6 +147,48 @@ Quando detectar que um jogo está em execução, a tela muda para exibir:
 
 Jogos conhecidos (processo no Linux/Windows): CS2, Valorant, Rocket League,
 Apex Legends, Fortnite, Minecraft, GTA V, Elden Ring, Dota 2, entre outros.
+Também detecta **Steam Remote Play** (`streaming_client`) e sessões ativas do
+**Moonlight** (Snap/Flatpak/nativo) — jogos, **Desktop remoto** e Steam Big
+Picture — enquanto houver tráfego GameStream com o host Sunshine. O launcher
+aberto sem stream não troca para o modo GAMER.
+
+#### Jogo real no Desktop remoto (helper no Windows)
+
+Quando o Moonlight transmite o **Desktop**, rode **uma vez** no PC Windows:
+
+1. Copie `tools/host-game-helper`
+2. Dê dois cliques em `start-host-helper.bat`  
+   ou `install-host-helper.ps1` (inicia no logon)
+
+O helper **anuncia sozinho na LAN** (UDP). O Mini-PC escuta — sem IP, sem
+cadastrar jogos no Sunshine. Aceite a rede Privada se o Windows perguntar.
+Detalhes: `tools/host-game-helper/README.md`.
+
+### 4. LOCKED — Sessão bloqueada
+
+Quando o sistema operacional estiver bloqueado (tela de login / lock screen),
+a telinha entra no modo LOCKED automaticamente:
+
+- Brilho cai para **10%**
+- Exibe apenas a **hora** (centrada) + ícone de cadeado
+- Fundo e cores seguem o **tema do desktop** (wallpaper + accent COSMIC/Pop!_OS)
+- Notificações **nunca** são exibidas no painel enquanto estiver bloqueado
+  (a fila é drenada em silêncio; overlays ativos são cancelados ao entrar em LOCKED)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│                           🔒                                        │
+│                                                                     │
+│                        15:20:33                                     │
+│                       BLOQUEADO                                     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Detecção via `logind` (`LockedHint`) com fallback para
+`org.gnome.ScreenSaver`. Prioridade máxima: bloqueia mesmo com jogo ou mídia
+ativos. Ao desbloquear, volta ao modo apropriado (MAIN / MULTIMEDIA / GAMER).
 
 ### Forçar um modo
 
@@ -144,12 +199,14 @@ Para usar um modo específico sem detecção automática:
 sg dialout -c '.venv/bin/python clock-display.py --mode main'
 sg dialout -c '.venv/bin/python clock-display.py --mode multimedia'
 sg dialout -c '.venv/bin/python clock-display.py --mode gamer'
+sg dialout -c '.venv/bin/python clock-display.py --mode locked'
 ```
 
-Na execução sem `--mode`, o programa verifica a cada 2 segundos:
-1. **Jogo em execução?** → GAMER
-2. **Mídia reproduzindo?** → MULTIMEDIA
-3. **Nada?** → MAIN (relógio + notificações)
+Na execução sem `--mode`, o programa verifica periodicamente:
+1. **Sessão bloqueada?** → LOCKED (poll ~1s, brilho 10%)
+2. **Jogo em execução?** → GAMER
+3. **Mídia reproduzindo?** → MULTIMEDIA
+4. **Nada?** → MAIN (relógio + notificações)
 
 A troca é automática e não requer reinício do serviço.
 
@@ -159,21 +216,41 @@ Pare o serviço antes para evitar que dois processos disputem a porta serial:
 
 ```bash
 systemctl --user stop turing-clock.service
-cd /mnt/dados/dsv/turing-smart-screen-python
+cd /mnt/Dados/dsv/turing-smart-screen-python
 sg dialout -c '.venv/bin/python clock-display.py'
 ```
 
 Finalize o modo manual com `Ctrl+C`.
 
+## Disco Dados no boot
+
+O projeto vive no volume `Dados`. O caminho canônico é `/mnt/Dados` (via
+`/etc/fstab`). **Não use** `/run/media/...`: o udisks muda esse caminho e os
+serviços ficam apontando para um diretório inexistente.
+
+Monte o disco cedo, em caminho fixo (pede sudo):
+
+```bash
+cd /mnt/Dados/dsv/turing-smart-screen-python
+./setup-dados-mount.sh
+```
+
+Isso garante `/mnt/Dados` no `/etc/fstab` (`nofail` se o disco estiver ausente),
+cria o symlink de compatibilidade `/mnt/dados` → `/mnt/Dados` e monta agora.
+Depois reinstale os serviços a partir de `/mnt/Dados/...`.
+
 ## Instalar e iniciar automaticamente
 
 ```bash
-cd /mnt/dados/dsv/turing-smart-screen-python
+cd /mnt/Dados/dsv/turing-smart-screen-python
 ./install-clock-service.sh
 ```
 
-O instalador cria um link em `~/.config/systemd/user/` para a unidade mantida
-em `systemd/turing-clock.service`, habilita o serviço e o inicia imediatamente.
+O instalador copia launchers estáveis para
+`~/.local/share/turing-smart-screen/` (filesystem home), gera a unidade em
+`~/.config/systemd/user/` e a inicia. Os launchers resolvem o projeto em
+`/mnt/Dados` em runtime — a unidade **nunca** aponta para `/run/media`.
+A instalação falha se `/mnt/Dados/...` não estiver disponível.
 
 Comandos úteis:
 
