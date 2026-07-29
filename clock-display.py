@@ -603,6 +603,59 @@ def clean_notification_body(value):
     )
 
 
+def is_whatsapp_notification(app: str = "", title: str = "", body: str = "", *extra: str) -> bool:
+    """Detect native WhatsApp apps and WhatsApp Web (Chrome/Chromium notifications)."""
+    blob = " ".join([app or "", title or "", body or "", *[e or "" for e in extra]]).lower()
+    return "whatsapp" in blob or "web.whatsapp.com" in blob
+
+
+def redact_whatsapp_notification(
+    app: str,
+    title: str,
+    body: str,
+    *extra: str,
+) -> tuple[str, str, str]:
+    """Hide WhatsApp / WhatsApp Web message text; keep only who notified.
+
+    Chrome notifications often arrive as app=Google Chrome with
+    body starting with web.whatsapp.com — still redact those.
+    Returns (display_app, who, generic_body).
+    """
+    if not is_whatsapp_notification(app, title, body, *extra):
+        return app, title, body
+
+    who = clean_markup(title).strip()
+    generic = {
+        "",
+        "whatsapp",
+        "whatsapp web",
+        "whatsapp desktop",
+        "google chrome",
+        "chrome",
+        "chromium",
+        "chromium-browser",
+    }
+    if who.lower() in generic:
+        cleaned = clean_notification_body(body)
+        # Group-style body: "Alice: olá…" — keep only the sender prefix
+        if ":" in cleaned:
+            sender = cleaned.split(":", 1)[0].strip()
+            if (
+                sender
+                and len(sender) <= 80
+                and "\n" not in sender
+                and "whatsapp" not in sender.lower()
+            ):
+                who = sender
+        if who.lower() in generic:
+            who = "WhatsApp"
+
+    display_app = app
+    if _is_browser_app(app) or "whatsapp" not in (app or "").lower():
+        display_app = "WhatsApp"
+    return display_app, who, "Nova notificação"
+
+
 def dbus_unescape(value):
     return value.replace(r"\n", "\n").replace(r'\"', '"')
 
@@ -1461,6 +1514,9 @@ def notification_monitor():
                 capturing = False
                 return
             app, app_icon, title, body = values[0], values[1], values[2], values[3]
+            app, title, body = redact_whatsapp_notification(
+                app, title, body, app_icon, image_path
+            )
             icon = _prefer_site_icon(app_icon, image_path)
             note = Notification(app, icon, title, body, datetime.now().astimezone())
             notification_queue.put(note)

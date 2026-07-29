@@ -285,15 +285,21 @@ processo ainda estiver preso na serial.
 O programa executa `dbus-monitor` somente na sessão do usuário e observa as
 chamadas padrão `org.freedesktop.Notifications.Notify`. Ele não substitui nem
 bloqueia o `cosmic-notifications`: o aviso continua aparecendo normalmente no
-desktop e uma cópia ocupa a tela IPS por seis segundos. Em seguida, um resumo
-permanece na área abaixo do relógio até que a próxima notificação o substitua.
-Nomes de aplicativos não são exibidos e domínios no início da mensagem, como
-`web.whatsapp.com`, são removidos da cópia apresentada na tela IPS. O horário
-local de chegada acompanha a notificação em destaque e o resumo persistente.
+desktop e uma cópia ocupa a tela IPS por alguns segundos. Em seguida, um resumo
+permanece na área abaixo do relógio (retenção **15 min**) até expirar ou ser
+substituído. Domínios no início da mensagem, como `web.whatsapp.com`, são
+removidos da cópia apresentada na tela IPS. O horário local de chegada
+acompanha a notificação em destaque e o resumo persistente.
 
-Título e corpo podem conter conteúdo privado de mensageiros, e-mails e outros
-aplicativos. A tela é apenas visual: ações e botões da notificação continuam
-disponíveis somente no desktop.
+**Privacidade WhatsApp:** notificações do app WhatsApp **e do WhatsApp Web no
+Chrome/Chromium** (detectadas por `whatsapp` / `web.whatsapp.com` no app,
+título, corpo ou ícone) exibem só o remetente/grupo e o texto genérico
+**Nova notificação** — o corpo da mensagem nunca aparece no overlay nem no painel
+MAIN. O desktop continua mostrando o conteúdo completo normalmente.
+
+Título e corpo de outros aplicativos podem conter conteúdo privado. A tela é
+apenas visual: ações e botões da notificação continuam disponíveis somente no
+desktop.
 
 ## Personalização
 
