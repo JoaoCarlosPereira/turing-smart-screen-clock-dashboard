@@ -1,4 +1,8 @@
-# ![Icon](https://raw.githubusercontent.com/mathoudebine/turing-smart-screen-python/main/res/icons/monitor-icon-17865/24.png) turing-smart-screen-python
+# ![Icon](https://raw.githubusercontent.com/mathoudebine/turing-smart-screen-python/main/res/icons/monitor-icon-17865/24.png) Turing Smart Screen Clock Dashboard
+
+> Dashboard Linux para tela Turing/TURZX com relógio, clima, notificações, modos multimídia e gamer, bloqueio de sessão e integração com PCs remotos via UDP.
+>
+> Este repositório é um fork experimental e focado em uso pessoal do projeto original `turing-smart-screen-python`.
 
 > [!WARNING]
 > 
@@ -15,6 +19,19 @@ A Python system monitor program and an abstraction library for **small IPS USB-C
 > Configuração local: consulte [RELOGIO.md](RELOGIO.md) para usar a tela Turing
 > 3,5" como relógio no Linux, com início automático e recuperação após
 > desconexão USB.
+
+## Recursos do dashboard
+
+Este fork adiciona uma experiência dedicada de relógio e monitoramento para Linux:
+
+- **MAIN**: relógio, data, clima do Open-Meteo e resumo de notificações do desktop.
+- **MULTIMEDIA**: faixa atual, artista, capa, progresso e volume via MPRIS2.
+- **GAMER**: arte, tempo de sessão e métricas de hardware para jogos locais e Steam Remote Play.
+- **LOCKED**: relógio com brilho reduzido quando a sessão está bloqueada.
+- **PCs remotos**: o `tools/host-game-helper/foreground_reporter.py` roda no PC Windows e anuncia o software/jogo aberto via UDP broadcast e multicast; o dashboard recebe os dados automaticamente na porta `8787`.
+- **Serviços Linux**: scripts opcionais para iniciar o relógio, reconectar Bluetooth e encaminhar mensagens do iPhone como notificações do desktop.
+
+Para o fluxo completo de instalação e operação, consulte [RELOGIO.md](RELOGIO.md).
 
 Supported operating systems : macOS, Windows, Linux (incl. Raspberry Pi), basically all OS that support Python 3.9+  
 

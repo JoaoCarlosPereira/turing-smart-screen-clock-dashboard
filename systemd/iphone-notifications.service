@@ -1,0 +1,17 @@
+[Unit]
+Description=Notificações de mensagens do iPhone no desktop
+After=bluetooth-autoconnect.service graphical-session.target
+Wants=bluetooth-autoconnect.service
+RequiresMountsFor=/mnt/Dados
+
+[Service]
+Type=simple
+# Launcher on home FS resolves the project under /mnt/Dados at runtime.
+# Bluetooth address is injected by install-iphone-notifications-service.sh
+ExecStart=%h/.local/share/turing-smart-screen/bin/run-iphone-notifications.sh 80:A9:97:F2:7C:2C
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

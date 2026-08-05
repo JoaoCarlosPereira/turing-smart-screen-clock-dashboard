@@ -1,0 +1,16 @@
+[Unit]
+Description=Reconecta automaticamente dispositivos Bluetooth pareados
+After=bluetooth.target graphical-session.target
+Wants=graphical-session.target
+RequiresMountsFor=/mnt/Dados
+
+[Service]
+Type=simple
+# Launcher on home FS resolves the project under /mnt/Dados at runtime.
+ExecStart=%h/.local/share/turing-smart-screen/bin/run-bluetooth-autoconnect.sh
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

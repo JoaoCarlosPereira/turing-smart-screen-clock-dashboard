@@ -30,6 +30,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -111,6 +112,9 @@ last_successful_frame_at = 0.0
 last_recovery_at = 0.0
 last_soft_nudge_at = 0.0
 recovery_hard_next = False
+# Collapse FDO Notify doubles + portal→impl→gtk fan-out of the same toast.
+_NOTIFICATION_DEDUP_SECONDS = 2.5
+_recent_notifications: deque[tuple[float, str, str]] = deque(maxlen=64)
 
 
 class ResilientLcd(LcdCommRevA):
@@ -1486,12 +1490,74 @@ def _parse_dbus_string_line(line: str) -> str | None:
     return None  # multiline start handled by caller
 
 
+def _app_label_from_portal_id(app_id: str) -> str:
+    """Turn Flatpak/desktop ids (com.discordapp.Discord) into a short label."""
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return "App"
+    if "." in app_id:
+        return app_id.rsplit(".", 1)[-1]
+    return app_id
+
+
+def _notification_dedup_key(title: str, body: str) -> tuple[str, str]:
+    return ((title or "").strip(), clean_notification_body(body or "").strip())
+
+
+def _is_duplicate_notification(title: str, body: str) -> bool:
+    """True if the same title/body was enqueued within the dedup window."""
+    key = _notification_dedup_key(title, body)
+    if not key[0] and not key[1]:
+        return False
+    now = time.monotonic()
+    while _recent_notifications and now - _recent_notifications[0][0] > _NOTIFICATION_DEDUP_SECONDS:
+        _recent_notifications.popleft()
+    for ts, prev_title, prev_body in _recent_notifications:
+        if (prev_title, prev_body) == key:
+            return True
+    _recent_notifications.append((now, key[0], key[1]))
+    return False
+
+
+def _enqueue_notification(app: str, app_icon: str, title: str, body: str, image_path: str = ""):
+    app, title, body = redact_whatsapp_notification(
+        app, title, body, app_icon, image_path
+    )
+    if _is_duplicate_notification(title, body):
+        logger.debug("Skipping duplicate notification (app=%r title=%r)", app, title)
+        return
+    icon = _prefer_site_icon(app_icon, image_path)
+    note = Notification(app, icon, title, body, datetime.now().astimezone())
+    notification_queue.put(note)
+    resolved = resolve_icon_path(note.icon, note.app)
+    logger.info(
+        "Desktop notification received (app=%r app_icon=%r image_path=%r -> %s)",
+        note.app,
+        app_icon,
+        image_path or "",
+        resolved or note.icon or "fallback",
+    )
+
+
 def notification_monitor():
-    """Watch Notify calls; prefer image-path (site icon) over app_icon (browser logo)."""
+    """Mirror every desktop notification path used on GNOME/Flatpak.
+
+    Paths:
+      - org.freedesktop.Notifications.Notify (native/Electron host apps)
+      - org.freedesktop.impl.portal.Notification.AddNotification (portal backend)
+      - org.gtk.Notifications.AddNotification (GNOME gtk bridge / direct GTK apps)
+
+    Flatpak clients hit the public portal first; GNOME then fans out to impl and
+    gtk with the real app_id. We watch those (not the public portal) so labels
+    like Discord stay correct. Notify is often forwarded twice by the shell;
+    content dedup collapses copies within a short window.
+    """
     global monitor_process
     command = [
         "stdbuf", "-oL", "dbus-monitor", "--session",
         "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+        "type='method_call',interface='org.freedesktop.impl.portal.Notification',member='AddNotification'",
+        "type='method_call',interface='org.gtk.Notifications',member='AddNotification'",
     ]
     try:
         monitor_process = subprocess.Popen(
@@ -1508,26 +1574,41 @@ def notification_monitor():
         multiline = None
         multiline_target = None  # "value" or "hint"
 
+        # AddNotification: public portal = (id, dict); impl/gtk = (app_id, id, dict)
+        portal_capturing = False
+        portal_depth = 0
+        portal_seen_depth = False
+        portal_strings: list[str] = []
+        portal_fields: dict[str, str] = {}
+        portal_pending_key = None
+        portal_multiline = None
+
+        def reset_notify():
+            nonlocal capturing, values, image_path, pending_hint, multiline, multiline_target
+            capturing = True
+            values = []
+            image_path = ""
+            pending_hint = None
+            multiline = None
+            multiline_target = None
+
+        def reset_portal():
+            nonlocal portal_capturing, portal_depth, portal_seen_depth
+            nonlocal portal_strings, portal_fields, portal_pending_key, portal_multiline
+            portal_capturing = True
+            portal_depth = 0
+            portal_seen_depth = False
+            portal_strings = []
+            portal_fields = {}
+            portal_pending_key = None
+            portal_multiline = None
+
         def finalize_note():
             nonlocal capturing, values, image_path, pending_hint, multiline, multiline_target
             if len(values) < 4:
                 capturing = False
                 return
-            app, app_icon, title, body = values[0], values[1], values[2], values[3]
-            app, title, body = redact_whatsapp_notification(
-                app, title, body, app_icon, image_path
-            )
-            icon = _prefer_site_icon(app_icon, image_path)
-            note = Notification(app, icon, title, body, datetime.now().astimezone())
-            notification_queue.put(note)
-            resolved = resolve_icon_path(note.icon, note.app)
-            logger.info(
-                "Desktop notification received (app=%r app_icon=%r image_path=%r -> %s)",
-                note.app,
-                app_icon,
-                image_path or "",
-                resolved or note.icon or "fallback",
-            )
+            _enqueue_notification(values[0], values[1], values[2], values[3], image_path)
             capturing = False
             values = []
             image_path = ""
@@ -1535,18 +1616,100 @@ def notification_monitor():
             multiline = None
             multiline_target = None
 
+        def finalize_portal():
+            nonlocal portal_capturing, portal_depth, portal_seen_depth
+            nonlocal portal_strings, portal_fields, portal_pending_key, portal_multiline
+            if not portal_capturing:
+                return
+            # Public portal: [id]; impl/gtk: [app_id, id]
+            if len(portal_strings) >= 2:
+                app_id = portal_strings[0]
+            else:
+                app_id = ""
+            title = portal_fields.get("title") or ""
+            body = portal_fields.get("body") or ""
+            icon = portal_fields.get("icon") or ""
+            if title or body:
+                app = _app_label_from_portal_id(app_id)
+                persisted = _persist_notification_icon(icon) if icon else ""
+                _enqueue_notification(app, persisted or icon, title, body, "")
+            portal_capturing = False
+            portal_depth = 0
+            portal_seen_depth = False
+            portal_strings = []
+            portal_fields = {}
+            portal_pending_key = None
+            portal_multiline = None
+
         for raw_line in monitor_process.stdout:
             if not running:
                 break
             line = raw_line.rstrip("\n")
             if line.startswith("method call") and "member=Notify" in line:
-                capturing = True
-                values = []
-                image_path = ""
-                pending_hint = None
-                multiline = None
-                multiline_target = None
+                finalize_portal()
+                reset_notify()
                 continue
+            if line.startswith("method call") and "member=AddNotification" in line:
+                finalize_note()
+                capturing = False
+                reset_portal()
+                continue
+
+            if portal_capturing:
+                if portal_multiline is not None:
+                    portal_multiline += "\n" + line
+                    if line.rstrip().endswith('"'):
+                        text = dbus_unescape(portal_multiline[:-1])
+                        if portal_pending_key:
+                            if portal_pending_key not in portal_fields:
+                                portal_fields[portal_pending_key] = text
+                            portal_pending_key = None
+                        elif len(portal_strings) < 2:
+                            portal_strings.append(text)
+                        portal_multiline = None
+                    continue
+
+                portal_depth += line.count("[") + line.count("(")
+                portal_depth -= line.count("]") + line.count(")")
+                if portal_depth > 0:
+                    portal_seen_depth = True
+
+                # Collect leading strings only before the notification dict opens.
+                if not portal_seen_depth and len(portal_strings) < 2:
+                    match = re.match(r'\s+string "(.*)', line)
+                    if match:
+                        value = match.group(1)
+                        if line.rstrip().endswith('"'):
+                            portal_strings.append(dbus_unescape(value[:-1]))
+                        else:
+                            portal_multiline = value
+                elif portal_depth >= 1:
+                    key_match = re.match(
+                        r'\s+string "(title|body|icon)"\s*$', line
+                    )
+                    if key_match:
+                        portal_pending_key = key_match.group(1)
+                        continue
+                    if portal_pending_key:
+                        if "variant" in line and "string \"" in line:
+                            parsed = _parse_dbus_string_line(line)
+                            if parsed is not None:
+                                if portal_pending_key not in portal_fields:
+                                    portal_fields[portal_pending_key] = parsed
+                                portal_pending_key = None
+                            else:
+                                match = re.match(r'\s*variant\s+string "(.*)', line)
+                                if match:
+                                    portal_multiline = match.group(1)
+                            continue
+                        if re.match(r"\s+variant\s*$", line):
+                            continue
+                        portal_pending_key = None
+
+                if portal_seen_depth and portal_depth <= 0:
+                    finalize_portal()
+                continue
+
             if not capturing:
                 continue
 

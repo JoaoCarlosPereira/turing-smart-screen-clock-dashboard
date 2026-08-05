@@ -147,22 +147,8 @@ Quando detectar que um jogo está em execução, a tela muda para exibir:
 
 Jogos conhecidos (processo no Linux/Windows): CS2, Valorant, Rocket League,
 Apex Legends, Fortnite, Minecraft, GTA V, Elden Ring, Dota 2, entre outros.
-Também detecta **Steam Remote Play** (`streaming_client`) e sessões ativas do
-**Moonlight** (Snap/Flatpak/nativo) — jogos, **Desktop remoto** e Steam Big
-Picture — enquanto houver tráfego GameStream com o host Sunshine. O launcher
-aberto sem stream não troca para o modo GAMER.
-
-#### Jogo real no Desktop remoto (helper no Windows)
-
-Quando o Moonlight transmite o **Desktop**, rode **uma vez** no PC Windows:
-
-1. Copie `tools/host-game-helper`
-2. Dê dois cliques em `start-host-helper.bat`  
-   ou `install-host-helper.ps1` (inicia no logon)
-
-O helper **anuncia sozinho na LAN** (UDP). O Mini-PC escuta — sem IP, sem
-cadastrar jogos no Sunshine. Aceite a rede Privada se o Windows perguntar.
-Detalhes: `tools/host-game-helper/README.md`.
+Também detecta **Steam Remote Play** (`streaming_client`). **Moonlight não é
+detectado** — stream remoto não troca para o modo GAMER.
 
 ### 4. LOCKED — Sessão bloqueada
 
@@ -282,14 +268,22 @@ processo ainda estiver preso na serial.
 
 ## Notificações do Pop!_OS
 
-O programa executa `dbus-monitor` somente na sessão do usuário e observa as
-chamadas padrão `org.freedesktop.Notifications.Notify`. Ele não substitui nem
-bloqueia o `cosmic-notifications`: o aviso continua aparecendo normalmente no
-desktop e uma cópia ocupa a tela IPS por alguns segundos. Em seguida, um resumo
-permanece na área abaixo do relógio (retenção **15 min**) até expirar ou ser
-substituído. Domínios no início da mensagem, como `web.whatsapp.com`, são
-removidos da cópia apresentada na tela IPS. O horário local de chegada
-acompanha a notificação em destaque e o resumo persistente.
+O programa executa `dbus-monitor` somente na sessão do usuário e observa todos
+os caminhos de notificação usados no GNOME/Flatpak:
+
+- `org.freedesktop.Notifications.Notify` (apps nativos: Chrome, Cursor, etc.)
+- `org.freedesktop.impl.portal.Notification.AddNotification` (backend do portal)
+- `org.gtk.Notifications.AddNotification` (ponte GTK do GNOME / apps GTK)
+
+O mesmo aviso pode aparecer em mais de um caminho (shell reencaminha `Notify`;
+Flatpak faz portal → impl → gtk). Cópias iguais em ~2,5s são deduplicadas.
+
+Ele não substitui nem bloqueia as notificações do desktop: o aviso continua
+aparecendo normalmente e uma cópia ocupa a tela IPS por alguns segundos. Em
+seguida, um resumo permanece na área abaixo do relógio (retenção **15 min**)
+até expirar ou ser substituído. Domínios no início da mensagem, como
+`web.whatsapp.com`, são removidos da cópia apresentada na tela IPS. O horário
+local de chegada acompanha a notificação em destaque e o resumo persistente.
 
 **Privacidade WhatsApp:** notificações do app WhatsApp **e do WhatsApp Web no
 Chrome/Chromium** (detectadas por `whatsapp` / `web.whatsapp.com` no app,
