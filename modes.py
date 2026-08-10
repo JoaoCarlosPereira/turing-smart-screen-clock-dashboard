@@ -1262,9 +1262,15 @@ class MultimediaDetector:
     def __init__(self):
         self._last_info = MultimediaInfo()
         self._player_names: dict[str, str] = {}  # bus_name -> player_id
+        self._last_time = time.time()
+        self._local_position = 0.0
 
     def detect(self) -> MultimediaInfo:
         """Query all MPRIS2 players and return the playing one."""
+        now = time.time()
+        dt = now - self._last_time
+        self._last_time = now
+
         try:
             player_names = self._get_mpris_players()
         except Exception as exc:
@@ -1272,6 +1278,12 @@ class MultimediaDetector:
             vol, muted = get_system_volume()
             self._last_info.volume = vol
             self._last_info.muted = muted
+            if self._last_info.is_playing:
+                self._local_position = min(
+                    self._last_info.length,
+                    self._local_position + dt
+                )
+                self._last_info.position = self._local_position
             return self._last_info
 
         # Prioritize common real players over utility players (playerctld, etc.)
@@ -1286,6 +1298,7 @@ class MultimediaDetector:
                                                x[1] in priority and x[1] not in priority))
 
         # Check each player
+        found_info = None
         for bus_name, player_id in sorted_players:
             info = self._get_player_info(bus_name, player_id)
             if info and (info.is_playing or info.title):
@@ -1293,14 +1306,37 @@ class MultimediaDetector:
                 vol, muted = get_system_volume()
                 info.volume = vol
                 info.muted = muted
-                self._last_info = info
-                return info
+                found_info = info
+                break
+
+        if found_info:
+            # If same track, estimate position locally if D-Bus reports 0
+            if (
+                found_info.title == self._last_info.title
+                and found_info.artist == self._last_info.artist
+            ):
+                if found_info.position > 0:
+                    self._local_position = found_info.position
+                elif found_info.is_playing:
+                    self._local_position = min(
+                        found_info.length or 3600.0,
+                        self._local_position + dt
+                    )
+                    found_info.position = self._local_position
+                logger.debug("Multimedia progress: title=%s pos=%.1fs len=%.1fs dt=%.3fs", 
+                             found_info.title, found_info.position, found_info.length, dt)
+            else:
+                self._local_position = found_info.position
+
+            self._last_info = found_info
+            return found_info
 
         # No playing media, but keep last info as paused
         self._last_info.is_playing = False
         vol, muted = get_system_volume()
         self._last_info.volume = vol
         self._last_info.muted = muted
+        self._last_info.position = self._local_position
         return self._last_info
 
     def _get_mpris_players(self) -> dict[str, str]:
@@ -1326,7 +1362,12 @@ class MultimediaDetector:
                 if len(parts) >= 1 and parts[0].startswith(prefix):
                     bus_name = parts[0]
                     # Extract player name (e.g., "spotify" from "org.mpris.MediaPlayer2.spotify")
-                    player_id = bus_name.split(".")[-1]
+                    # or "firefox" from "org.mpris.MediaPlayer2.firefox.instance_1_183"
+                    match = re.search(rf'{prefix}(\w+)', bus_name)
+                    if match:
+                        player_id = match.group(1)
+                    else:
+                        player_id = bus_name.split(".")[-1]
                     names[bus_name] = player_id
             return names
         except (subprocess.SubprocessError, OSError):
@@ -1366,6 +1407,23 @@ class MultimediaDetector:
                     info.length = length_us / 1_000_000
                 if isinstance(info.artist, list):
                     info.artist = " / ".join(str(a) for a in info.artist)
+
+            # Fallback: if no mpris:artUrl, try to extract YouTube thumbnail
+            # from xesam:url (YouTube does not provide mpris:artUrl)
+            if not info.cover_url:
+                yt_url = self._extract_metadata(metadata, "xesam:url") or ""
+                if yt_url:
+                    yt_url = yt_url.strip()
+                    info.cover_url = self._resolve_youtube_thumbnail(yt_url)
+
+            # Fallback: if no mpris:length, try to extract YouTube duration
+            # from xesam:url via YouTube HTML scraping (YouTube does not provide mpris:length)
+            if not info.length:
+                yt_url = self._extract_metadata(metadata, "xesam:url") or ""
+                if yt_url:
+                    yt_url = yt_url.strip()
+                    info.length = self._resolve_youtube_duration(yt_url) or 0.0
+                    logger.debug("YouTube duration resolved: url=%s length=%.1fs", yt_url, info.length)
 
             if position is not None:
                 try:
@@ -1463,6 +1521,60 @@ class MultimediaDetector:
         match = re.search(rf'{key}"\s+[txui]\s+(\d+)', metadata)
         if match:
             return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _resolve_youtube_thumbnail(url: str) -> str:
+        """Extract a YouTube video ID from URL and return thumbnail URL."""
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            if parsed.hostname and "youtube" in parsed.hostname:
+                video_id = parse_qs(parsed.query).get("v")
+                if video_id:
+                    return f"https://img.youtube.com/vi/{video_id[0]}/maxresdefault.jpg"
+            # Also handle youtube.com/shorts/VIDEO_ID
+            path = parsed.path.strip("/")
+            if parsed.hostname and "youtube" in parsed.hostname and path.startswith("shorts/"):
+                video_id = path.split("/")[0]
+                return f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _resolve_youtube_duration(url: str) -> Optional[float]:
+        """Resolve YouTube video duration in seconds by scraping video page."""
+        if not url:
+            return None
+        try:
+            from urllib.request import Request, urlopen
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            video_id = None
+            if parsed.hostname and "youtube" in parsed.hostname:
+                video_id = parse_qs(parsed.query).get("v")
+            if not video_id and parsed.hostname and "youtube" in parsed.hostname:
+                path = parsed.path.strip("/")
+                if path.startswith("shorts/"):
+                    video_id = path.split("/")[0]
+            if not video_id:
+                return None
+            video_id = video_id[0]
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            req = Request(video_url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
+            })
+            with urlopen(req, timeout=5) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            # Extract lengthSeconds from embedded JSON metadata
+            match = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', html)
+            if match:
+                return float(match.group(1))
+        except Exception:
+            pass
         return None
 
     def _load_cover_art(self, url: str) -> Optional[object]:

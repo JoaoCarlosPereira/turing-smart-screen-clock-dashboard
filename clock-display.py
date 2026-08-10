@@ -2160,8 +2160,6 @@ if __name__ == "__main__":
                             mode_render_time = current_time
                             last_track_key = track_key
                             display_image(lcd, mode_render_cache)
-                        elif media.is_playing and media.length > 0:
-                            media.position = min(media.length, media.position + 0.2)
 
                     elif mode_manager.state.current_mode == Mode.GAMER:
                         if current_time - mode_render_time >= MODE_CACHE_TTL:
