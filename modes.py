@@ -152,6 +152,7 @@ KNOWN_GAMES = {
     "stellaris": "Stellaris",
     "civilizationvi": "Civilization VI",
     "dota2": "Dota 2",
+    "hl2": "Half-Life 2",
 }
 
 # Never treat these as games (Steam UI / helpers always running)
@@ -237,6 +238,7 @@ STEAM_APP_NAMES = {
     "1086940": "Baldur's Gate 3",
     "1938090": "Call of Duty",
     "2357570": "Overwatch 2",
+    "420": "Half-Life 2",
 }
 
 # Process stem → Steam AppID (for local launches without streaming_client)
@@ -260,6 +262,7 @@ KNOWN_GAME_APPIDS = {
     "overwatch": "2357570",
     "overwatch2": "2357570",
     "ow2": "2357570",
+    "hl2": "420",
 }
 
 STEAM_NAME_CACHE_PATH = Path.home() / ".cache" / "turing-clock" / "steam-app-names.json"
@@ -885,8 +888,114 @@ _BORING_FOREGROUND_STEMS = {
 }
 
 
+def _match_game_name_from_text(text: str) -> tuple[str, str]:
+    """Match a free-text label against known games / Steam names.
+
+    Returns (display_name, steam_appid); ("", "") when no real game matches.
+    """
+    needle = (text or "").strip().lower()
+    if not needle:
+        return "", ""
+    for key, name in KNOWN_GAMES.items():
+        if len(key) < 4:
+            continue
+        if key in needle or name.lower() == needle or name.lower() in needle:
+            return name, KNOWN_GAME_APPIDS.get(key, "")
+    for appid, name in STEAM_APP_NAMES.items():
+        if name.lower() == needle or name.lower() in needle:
+            return name, appid
+    for appid, name in _load_steam_name_cache().items():
+        if str(name).lower() == needle or str(name).lower() in needle:
+            return str(name), str(appid)
+    return "", ""
+
+
+# Exe stems the Windows helper reports when a *non-game* window has focus.
+# The old helper (no is_game flag) falls back to a running known game when a
+# shell has focus — in that case the payload carries the *game* exe. When it
+# reports one of these exes, no game is focused/running, so the announcement
+# is filtered out locally regardless of the title text.
+_NON_GAME_HELPER_EXES = {
+    # shells / terminals
+    "cmd",
+    "powershell",
+    "pwsh",
+    "conhost",
+    "openconsole",
+    "windowsterminal",
+    "wt",
+    # Windows shell / UI
+    "explorer",
+    "searchhost",
+    "searchui",
+    "shellexperiencehost",
+    "textinputhost",
+    "applicationframehost",
+    "startmenuexperiencehost",
+    "taskhostw",
+    "sihost",
+    "dwm",
+    "winlogon",
+    "ctfmon",
+    "fontdrvhost",
+    "runtimebroker",
+    "svchost",
+    # browsers
+    "chrome",
+    "msedge",
+    "firefox",
+    "brave",
+    "opera",
+    # office / editors
+    "excel",
+    "winword",
+    "powerpnt",
+    "outlook",
+    "wordpad",
+    "notepad",
+    "mspaint",
+    "code",
+    "idea64",
+    "pycharm64",
+    "rider64",
+    # media / chat
+    "vlc",
+    "spotify",
+    "discord",
+    "teams",
+    # streaming hosts / this helper
+    "sunshine",
+    "sunshinesvc",
+    "foreground_reporter",
+    # python (helper / tools)
+    "python",
+    "pythonw",
+    "py",
+}
+
+
+def _classify_helper_payload(payload: dict) -> tuple[str, str]:
+    """Filter one Windows-helper announcement against the local game list.
+
+    The Mini-PC is the authority for "is this a game": the helper may be an
+    old version (no is_game flag, announcing any focused window) or a new
+    one — either way only recognized games pass through.
+    """
+    title = str(payload.get("title") or "")
+    exe = str(payload.get("exe") or "")
+    stem = Path(exe.replace("\\", "/")).stem.lower()
+    if stem in _NON_GAME_HELPER_EXES:
+        return "", ""
+    return _match_game_from_foreground(title, exe)
+
+
 def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
-    """Map helper title/exe to (display_name, steam_appid)."""
+    """Map helper title/exe to (display_name, steam_appid).
+
+    Strict: only a *recognized* game yields a hit. Unmatched foreground
+    windows (browser, office, file manager, ...) return ("", "") so a
+    Desktop stream alone never looks like a game.
+    """
     stem = Path((exe or "").replace("\\", "/")).stem.lower()
     cleaned = _clean_foreground_title(title, exe)
     if not cleaned:
@@ -906,26 +1015,7 @@ def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
         appid = KNOWN_GAME_APPIDS[stem]
         return resolve_steam_app_name(appid), appid
 
-    needle = cleaned.lower()
-    for key, name in KNOWN_GAMES.items():
-        if len(key) < 4:
-            continue
-        if key in needle or name.lower() == needle or name.lower() in needle:
-            return name, KNOWN_GAME_APPIDS.get(key, "")
-
-    for appid, name in STEAM_APP_NAMES.items():
-        if name.lower() == needle or name.lower() in needle:
-            return name, appid
-
-    cache = _load_steam_name_cache()
-    for appid, name in cache.items():
-        if str(name).lower() == needle or str(name).lower() in needle:
-            return str(name), str(appid)
-
-    appid = _appid_for_process(stem or cleaned, cleaned)
-    if appid:
-        return resolve_steam_app_name(appid) or cleaned, appid
-    return cleaned, ""
+    return _match_game_name_from_text(cleaned)
 
 
 def _resolve_moonlight_display_name(proc, hosts: list[dict], cmdline: list[str]) -> str:
@@ -934,22 +1024,36 @@ def _resolve_moonlight_display_name(proc, hosts: list[dict], cmdline: list[str])
 
 
 def _resolve_moonlight_game_info(proc, hosts: list[dict], cmdline: list[str]) -> dict:
-    """Resolve Moonlight session label + optional Steam appid (host helper first)."""
+    """Resolve the streamed app (host helper first) and whether it is a real game.
+
+    The GAMER mode may only be entered when ``is_game`` is True — a Desktop
+    remoto stream without a detected game must not flip the screen.
+    """
     hostname = (hosts[0].get("hostname") if hosts else "") or ""
 
     helper = _query_host_game_helper(hosts)
     if helper:
-        display, appid = _match_game_from_foreground(
-            str(helper.get("title") or ""),
-            str(helper.get("exe") or ""),
-        )
+        # Local list is the authority so both helper versions behave the
+        # same: the old helper announces ANY focused window (no is_game),
+        # the new one may send is_game — either way only a recognized game
+        # passes. Non-game exes (browser, office, shell) are filtered here.
+        display, appid = _classify_helper_payload(helper)
         if display:
-            return {"display_name": display, "appid": appid}
+            return {"display_name": display, "appid": appid, "is_game": True}
+        # No recognized game focused — the stream is Desktop-only right
+        # now; do not surface a stale game name from a previous poll.
+        return {"display_name": "", "appid": "", "is_game": False}
 
     cmdline_name = _moonlight_name_from_cmdline(cmdline)
     if cmdline_name:
         name = _format_moonlight_session_name(cmdline_name, hostname)
-        return {"display_name": name, "appid": _appid_for_process("moonlight", cmdline_name)}
+        matched_name, _ = _match_game_name_from_text(cmdline_name)
+        is_game = bool(matched_name)
+        return {
+            "display_name": name if is_game else "",
+            "appid": _appid_for_process("moonlight", cmdline_name) if is_game else "",
+            "is_game": is_game,
+        }
 
     app_id = None
     for ip in _preferred_moonlight_ips(hosts)[:1]:
@@ -964,14 +1068,16 @@ def _resolve_moonlight_game_info(proc, hosts: list[dict], cmdline: list[str]) ->
         mapped = _moonlight_app_name_from_hosts(hosts, app_id)
         if mapped:
             name = _format_moonlight_session_name(mapped, hostname)
-            return {"display_name": name, "appid": _appid_for_process("moonlight", mapped)}
-        name = _format_moonlight_session_name(f"App {app_id}", hostname)
-        return {"display_name": name, "appid": ""}
+            return {
+                "display_name": name,
+                "appid": _appid_for_process("moonlight", mapped),
+                "is_game": True,
+            }
+        # "App <id>" is an unlabelled Sunshine entry (often the Desktop app).
+        return {"display_name": "", "appid": "", "is_game": False}
 
-    if hosts:
-        name = _format_moonlight_session_name("Moonlight", hostname)
-        return {"display_name": name, "appid": ""}
-    return {"display_name": "Moonlight", "appid": ""}
+    # Generic "Moonlight" / "Desktop remoto" — no game detected.
+    return {"display_name": "", "appid": "", "is_game": False}
 
 
 def _appid_for_process(proc_name: str, display_name: str = "") -> str:
@@ -1765,13 +1871,16 @@ class GamerDetector:
                     game_info = _resolve_moonlight_game_info(
                         proc, moonlight_hosts or [], cmdline
                     )
-                    moonlight_hit = {
-                        "process": proc_name,
-                        "display_name": game_info["display_name"],
-                        "pid": pid,
-                        "appid": game_info.get("appid")
-                        or _appid_for_process(proc_name, game_info["display_name"]),
-                    }
+                    # Only a real game on the host flips the screen — a
+                    # Desktop remoto stream without a game must not enter GAMER.
+                    if game_info.get("is_game") and game_info.get("display_name"):
+                        moonlight_hit = {
+                            "process": proc_name,
+                            "display_name": game_info["display_name"],
+                            "pid": pid,
+                            "appid": game_info.get("appid")
+                            or _appid_for_process(proc_name, game_info["display_name"]),
+                        }
                 continue
 
             # Steam Remote Play — need cmdline only for these names
