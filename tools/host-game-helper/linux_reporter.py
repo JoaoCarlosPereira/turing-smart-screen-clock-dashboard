@@ -143,6 +143,14 @@ def _extract_metadata_int(metadata: str, key: str) -> int:
 
 
 def sample_media() -> dict | None:
+    """Media state of the player that is actually playing.
+
+    busctl lists players alphabetically, so a paused Chromium tab outranked a
+    playing Spotify and the screen never entered multimedia mode (the receiver
+    only accepts is_playing). Scan every player and let a playing one win;
+    a paused player is reported only when nothing is playing.
+    """
+    paused_fallback: dict | None = None
     for bus_name in _mpris_players():
         if "playerctld" in bus_name:
             continue
@@ -180,7 +188,7 @@ def sample_media() -> dict | None:
         # same way it does for local players (YouTube exposes no mpris:artUrl).
         track_url = _extract_metadata_field(metadata or "", "xesam:url")
 
-        return {
+        sample = {
             "title": title,
             "artist": artist,
             "album": album,
@@ -191,7 +199,11 @@ def sample_media() -> dict | None:
             "cover_url": cover_url,
             "url": track_url,
         }
-    return None
+        if is_playing:
+            return sample
+        if paused_fallback is None:
+            paused_fallback = sample
+    return paused_fallback
 
 
 # ---------------------------------------------------------------------------
