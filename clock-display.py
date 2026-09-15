@@ -49,6 +49,7 @@ from modes import Mode, ModeManager, MultimediaInfo, GamerInfo, LockInfo  # noqa
 from modes import render_multimedia_mode, render_gamer_mode, render_locked_mode  # noqa: F401
 from modes import _cover_fit, _extract_theme_colors  # noqa: F401
 from modes import pop_remote_notifications
+from modes import remote_desktop_state, fetch_remote_wallpaper
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1084,12 @@ def _system_theme_fingerprint_uncached() -> str:
             except OSError:
                 pass
 
+    # Remote host's wallpaper is part of the identity: when the PC being
+    # mirrored changes its background, the screen must reload the theme.
+    remote = remote_desktop_state()
+    if remote:
+        parts.append(f"remote-wp:{remote['wallpaper_id']}:{int(remote['is_dark'])}")
+
     wallpaper = _cosmic_wallpaper_path() or _gsettings_wallpaper_path()
     if wallpaper is not None:
         try:
@@ -1119,7 +1126,19 @@ def load_system_theme(force: bool = False) -> dict:
     ):
         return _SYSTEM_THEME_CACHE
 
-    wallpaper_path = _cosmic_wallpaper_path() or _gsettings_wallpaper_path()
+    # The screen now lives on a headless machine whose own desktop has no
+    # usable wallpaper, so a remote host's background wins when one is being
+    # advertised; the local desktop stays as the fallback.
+    wallpaper_path = None
+    using_remote = False
+    remote = remote_desktop_state()
+    if remote:
+        remote_file = fetch_remote_wallpaper(remote)
+        if remote_file:
+            wallpaper_path = Path(remote_file)
+            using_remote = True
+    if wallpaper_path is None:
+        wallpaper_path = _cosmic_wallpaper_path() or _gsettings_wallpaper_path()
     accent_hex = _cosmic_accent_hex()
     panel_hex = _cosmic_panel_hex()
 
@@ -1152,7 +1171,9 @@ def load_system_theme(force: bool = False) -> dict:
         "accent": accent,
         "accent2": accent2,
         "panel": panel,
-        "is_dark": _cosmic_is_dark(),
+        # Follow the mirrored host's light/dark preference when it is the one
+        # providing the wallpaper, so both halves of the theme agree.
+        "is_dark": remote["is_dark"] if using_remote else _cosmic_is_dark(),
         "fingerprint": fingerprint,
         "changed": changed,
     }

@@ -93,6 +93,7 @@ def build_state_payload(
     game: dict | None = None,
     media: dict | None = None,
     lock: dict | None = None,
+    desktop: dict | None = None,
 ) -> dict:
     payload = {
         "v": PROTOCOL_VERSION,
@@ -108,6 +109,8 @@ def build_state_payload(
         payload["media"] = media
     if lock is not None:
         payload["lock"] = lock
+    if desktop is not None:
+        payload["desktop"] = desktop
     return payload
 
 

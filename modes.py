@@ -200,6 +200,10 @@ _HOST_GAME_HELPER_SERVICE = "turing-host-game"
 # PCs report concurrently without clobbering each other.
 _REMOTE_HOST_REGISTRY: dict[str, dict] = {}
 _REMOTE_HOST_REGISTRY_LOCK = threading.Lock()
+# wallpaper_id -> monotonic time of the last failed download, so the render
+# path backs off instead of retrying a 4 MB transfer on every frame.
+_REMOTE_WALLPAPER_FAILED: dict[str, float] = {}
+_REMOTE_WALLPAPER_RETRY_SECONDS = 300.0
 _REMOTE_HOST_STALE_SECONDS = 10.0
 _REMOTE_NOTIFICATION_QUEUE: "queue.Queue[dict]" = queue.Queue()
 
@@ -800,6 +804,8 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
             "position": float(media_raw.get("position") or 0.0),
             "length": float(media_raw.get("length") or 0.0),
             "player_id": str(media_raw.get("player_id") or ""),
+            "cover_url": str(media_raw.get("cover_url") or ""),
+            "url": str(media_raw.get("url") or ""),
         }
 
     lock_raw = data.get("lock")
@@ -807,9 +813,18 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
     if isinstance(lock_raw, dict) and "is_locked" in lock_raw:
         lock = {"is_locked": bool(lock_raw.get("is_locked"))}
 
+    desktop_raw = data.get("desktop")
+    desktop = None
+    if isinstance(desktop_raw, dict) and desktop_raw.get("wallpaper_id"):
+        desktop = {
+            "wallpaper_id": str(desktop_raw.get("wallpaper_id") or ""),
+            "wallpaper_name": str(desktop_raw.get("wallpaper_name") or ""),
+            "is_dark": bool(desktop_raw.get("is_dark")),
+        }
+
     # Require at least one real sub-object so an empty keepalive tick neither
     # creates a bogus registry entry nor keeps an already-stale one alive.
-    if game is None and media is None and lock is None:
+    if game is None and media is None and lock is None and desktop is None:
         return
 
     with _REMOTE_HOST_REGISTRY_LOCK:
@@ -823,6 +838,7 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
                 "game": None,
                 "media": None,
                 "lock": None,
+                "desktop": None,
             },
         )
         entry["hostname"] = hostname or entry.get("hostname", "")
@@ -836,6 +852,8 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
             entry["media"] = media
         if lock is not None:
             entry["lock"] = lock
+        if desktop is not None:
+            entry["desktop"] = desktop
 
     if game is not None:
         # Keep the HTTP-fallback cache warm so _query_host_game_helper stays sync/fast.
@@ -908,17 +926,108 @@ def _remote_media_hit() -> Optional["MultimediaInfo"]:
         media = entry.get("media")
         if not media or not media.get("is_playing") or not media.get("title"):
             continue
+        cover_url = str(media.get("cover_url") or "")
+        if not cover_url:
+            # Same fallback the local path uses: YouTube exposes no artUrl, so
+            # derive the thumbnail from the track URL. Pure string work, safe
+            # to run on every detection tick.
+            cover_url = MultimediaDetector._resolve_youtube_thumbnail(
+                str(media.get("url") or "").strip()
+            )
         return MultimediaInfo(
             title=media["title"],
             artist=media.get("artist", ""),
             album=media.get("album", ""),
             app_name=entry.get("hostname") or entry["host_id"],
+            cover_url=cover_url,
             is_playing=True,
             position=float(media.get("position") or 0.0),
             length=float(media.get("length") or 0.0),
             player_id=f"remote:{media.get('player_id') or entry['host_id']}",
         )
     return None
+
+
+def remote_desktop_state() -> Optional[dict]:
+    """Freshest remote host advertising a desktop wallpaper, with its IP."""
+    for entry in _live_remote_hosts():
+        desktop = entry.get("desktop")
+        if desktop and desktop.get("wallpaper_id"):
+            return {
+                "wallpaper_id": desktop["wallpaper_id"],
+                "wallpaper_name": desktop.get("wallpaper_name", ""),
+                "is_dark": bool(desktop.get("is_dark")),
+                "source_ip": entry.get("source_ip", ""),
+                "hostname": entry.get("hostname", ""),
+            }
+    return None
+
+
+def _remote_wallpaper_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "turing-smart-screen" / "remote-wallpaper"
+
+
+def fetch_remote_wallpaper(state: Optional[dict] = None) -> str:
+    """Local path to the remote host's wallpaper, downloading it if needed.
+
+    Keyed by wallpaper_id, so the ~4 MB transfer happens once per wallpaper
+    change and every later call is a cache hit — this is consulted from the
+    render path. A failed download backs off for _REMOTE_WALLPAPER_RETRY_SECONDS,
+    so an unreachable host cannot stall the screen, while a transient network
+    glitch still heals on its own without a restart.
+    """
+    state = state or remote_desktop_state()
+    if not state or not state.get("source_ip"):
+        return ""
+
+    wallpaper_id = state["wallpaper_id"]
+    failed_at = _REMOTE_WALLPAPER_FAILED.get(wallpaper_id)
+    if failed_at and time.monotonic() - failed_at < _REMOTE_WALLPAPER_RETRY_SECONDS:
+        return ""
+
+    cache_dir = _remote_wallpaper_cache_dir()
+    cached = cache_dir / wallpaper_id
+    if cached.is_file():
+        return str(cached)
+
+    url = f"http://{state['source_ip']}:{_HOST_GAME_HELPER_DEFAULT_PORT}/wallpaper"
+    try:
+        from urllib.request import urlopen
+
+        with urlopen(url, timeout=8) as response:
+            raw = response.read()
+        if not raw:
+            raise ValueError("empty wallpaper response")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Write then rename so a truncated download is never served as valid.
+        partial = cached.with_suffix(".part")
+        partial.write_bytes(raw)
+        partial.replace(cached)
+        logger.info(
+            "Fetched remote wallpaper %s (%s, %.1f MB) from %s",
+            state.get("wallpaper_name") or wallpaper_id,
+            state.get("hostname") or state["source_ip"],
+            len(raw) / (1024 * 1024),
+            url,
+        )
+        _prune_remote_wallpaper_cache(cache_dir, keep=wallpaper_id)
+        _REMOTE_WALLPAPER_FAILED.pop(wallpaper_id, None)
+        return str(cached)
+    except Exception as exc:
+        logger.warning("Could not fetch remote wallpaper from %s: %s", url, exc)
+        _REMOTE_WALLPAPER_FAILED[wallpaper_id] = time.monotonic()
+        return ""
+
+
+def _prune_remote_wallpaper_cache(cache_dir: Path, keep: str) -> None:
+    """Keep only the wallpaper in use — old ids are dead weight on the SD card."""
+    try:
+        for item in cache_dir.iterdir():
+            if item.name != keep and item.is_file():
+                item.unlink()
+    except OSError as exc:
+        logger.debug("Could not prune wallpaper cache: %s", exc)
 
 
 def _remote_lock_hit() -> Optional[dict]:
@@ -1619,6 +1728,11 @@ class MultimediaDetector:
         # Nothing playing locally — fall back to a remote host agent's media state.
         remote_info = _remote_media_hit()
         if remote_info:
+            # Cover art is fetched here, not in _remote_media_hit, so it goes
+            # through _load_cover_art's per-URL cache — the remote agent ticks
+            # once a second and this runs on every render.
+            if remote_info.cover_url:
+                remote_info.cover_image = self._load_cover_art(remote_info.cover_url)
             self._local_position = remote_info.position
             self._last_info = remote_info
             return remote_info
