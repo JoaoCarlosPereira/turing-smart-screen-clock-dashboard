@@ -147,8 +147,11 @@ Quando detectar que um jogo está em execução, a tela muda para exibir:
 
 Jogos conhecidos (processo no Linux/Windows): CS2, Valorant, Rocket League,
 Apex Legends, Fortnite, Minecraft, GTA V, Elden Ring, Dota 2, entre outros.
-Também detecta **Steam Remote Play** (`streaming_client`). **Moonlight não é
-detectado** — stream remoto não troca para o modo GAMER.
+Também detecta **Steam Remote Play** (`streaming_client`) e sessões
+**Moonlight/Sunshine**: quando um PC remoto (Windows ou Ubuntu) roda o agente
+`tools/host-game-helper` e anuncia um jogo reconhecido, o modo GAMER também é
+ativado — um stream de "Desktop remoto" sem jogo reconhecido não entra em
+GAMER.
 
 ### 4. LOCKED — Sessão bloqueada
 

@@ -1,10 +1,13 @@
 [Unit]
 Description=Relogio da tela Turing IPS
-Documentation=file:/mnt/Dados/dsv/turing-smart-screen-python/RELOGIO.md
-# Start with the desktop session. RequiresMountsFor waits for /mnt/Dados (fstab)
-# so we do not spin while the Dados volume is still unmounted.
+Documentation=file:%h/dsv/turing-smart-screen-python/RELOGIO.md
+# Starts at boot with the user manager (default.target, needs `loginctl
+# enable-linger`) and is also wanted by the desktop session. Only the session
+# D-Bus/PipeWire are required, not a Wayland/X display. RequiresMountsFor waits
+# for /mnt/Dados (fstab) so we do not spin while the Dados volume is unmounted;
+# on hosts without a separate Dados disk (project lives under $HOME instead),
+# this resolves against the already-active root mount and is a no-op.
 After=graphical-session.target
-Wants=graphical-session.target
 RequiresMountsFor=/mnt/Dados
 StartLimitIntervalSec=0
 
@@ -24,4 +27,4 @@ SendSIGKILL=yes
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target graphical-session.target

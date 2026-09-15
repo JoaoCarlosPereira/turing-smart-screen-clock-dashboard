@@ -145,12 +145,17 @@ def _run_detect_game(processes, helper_payload=None, streaming=True):
     """Run GamerDetector._detect_game with psutil + network calls mocked."""
     detector = GamerDetector.__new__(GamerDetector)  # skip __init__ (no UDP listener)
     saved = (
-        modes.psutil.process_iter,
+        modes._iter_processes,
+        modes._process_handle,
         modes._moonlight_hosts,
         modes._proc_has_gamestream_traffic,
         modes._query_host_game_helper,
     )
-    modes.psutil.process_iter = lambda attrs=None: iter(processes)
+    by_pid = {p.info["pid"]: p for p in processes}
+    modes._iter_processes = lambda: [
+        (p.info["pid"], p.info["ppid"], p.info["name"]) for p in processes
+    ]
+    modes._process_handle = lambda pid: by_pid[pid]
     modes._moonlight_hosts = lambda: []
     modes._proc_has_gamestream_traffic = lambda proc, ips: streaming
     modes._query_host_game_helper = lambda hosts: dict(helper_payload) if helper_payload is not None else None
@@ -158,7 +163,8 @@ def _run_detect_game(processes, helper_payload=None, streaming=True):
         return detector._detect_game()
     finally:
         (
-            modes.psutil.process_iter,
+            modes._iter_processes,
+            modes._process_handle,
             modes._moonlight_hosts,
             modes._proc_has_gamestream_traffic,
             modes._query_host_game_helper,
@@ -248,6 +254,9 @@ class TestResolveMoonlightGameInfo(unittest.TestCase):
 class TestDetectGameGatesOnIsGame(unittest.TestCase):
     MOONLIGHT = _FakeProcess("moonlight", 1234, 500, cmdline=[], exe="/snap/bin/moonlight")
 
+    def tearDown(self):
+        modes._REMOTE_HOST_REGISTRY.clear()
+
     def test_recognized_game_enters(self):
         hit = _run_detect_game(
             [self.MOONLIGHT],
@@ -272,6 +281,35 @@ class TestDetectGameGatesOnIsGame(unittest.TestCase):
 
     def test_no_helper_never_enters(self):
         hit = _run_detect_game([self.MOONLIGHT], helper_payload=None)
+        self.assertIsNone(hit)
+
+    def test_remote_registry_hit_used_when_no_local_or_moonlight_hit(self):
+        # No Moonlight process at all (a Mini-PC with no local Moonlight client),
+        # but a remote host agent (protocol v2) reports a recognized game.
+        modes._REMOTE_HOST_REGISTRY["host-a"] = {
+            "host_id": "host-a",
+            "hostname": "gaming-pc",
+            "source_ip": "192.168.1.50",
+            "last_seen_mono": modes.time.monotonic(),
+            "game": {"title": "Palworld", "exe": r"C:\Games\Palworld\Palworld-Win64-Shipping.exe", "pid": 42},
+            "media": None,
+            "lock": None,
+        }
+        hit = _run_detect_game([], helper_payload=None)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["display_name"], "Palworld")
+
+    def test_remote_registry_non_game_filtered(self):
+        modes._REMOTE_HOST_REGISTRY["host-a"] = {
+            "host_id": "host-a",
+            "hostname": "desktop-pc",
+            "source_ip": "192.168.1.51",
+            "last_seen_mono": modes.time.monotonic(),
+            "game": {"title": "Mozilla Firefox", "exe": r"C:\Program Files\firefox.exe", "pid": 7},
+            "media": None,
+            "lock": None,
+        }
+        hit = _run_detect_game([], helper_payload=None)
         self.assertIsNone(hit)
 
 

@@ -48,6 +48,7 @@ from library.log import logger
 from modes import Mode, ModeManager, MultimediaInfo, GamerInfo, LockInfo  # noqa: F401
 from modes import render_multimedia_mode, render_gamer_mode, render_locked_mode  # noqa: F401
 from modes import _cover_fit, _extract_theme_colors  # noqa: F401
+from modes import pop_remote_notifications
 
 
 # ---------------------------------------------------------------------------
@@ -1043,8 +1044,25 @@ def _theme_watch_paths() -> list[Path]:
     return paths
 
 
+_FINGERPRINT_MEMO: tuple[float, str] = (0.0, "")
+
+
 def system_theme_fingerprint() -> str:
-    """Cheap fingerprint of desktop wallpaper/accent/theme inputs."""
+    """Cheap fingerprint of desktop wallpaper/accent/theme inputs.
+
+    Memoized for THEME_WATCH_SECONDS: on GNOME this shells out to gsettings,
+    and the MAIN clock asks for it every second.
+    """
+    global _FINGERPRINT_MEMO
+    memo_at, memo_value = _FINGERPRINT_MEMO
+    if memo_value and time.monotonic() - memo_at < THEME_WATCH_SECONDS:
+        return memo_value
+    value = _system_theme_fingerprint_uncached()
+    _FINGERPRINT_MEMO = (time.monotonic(), value)
+    return value
+
+
+def _system_theme_fingerprint_uncached() -> str:
     parts: list[str] = []
     for path in _theme_watch_paths():
         try:
@@ -1114,6 +1132,10 @@ def load_system_theme(force: bool = False) -> dict:
         try:
             wallpaper = Image.open(wallpaper_path).convert("RGB")
             extracted = _extract_theme_colors(wallpaper)
+            # Every renderer cover-fits to WIDTH×HEIGHT anyway. Doing it once
+            # here turns a ~200 ms LANCZOS resize of a 4K file (per second!)
+            # into a no-op and drops the cached wallpaper from ~25 MB to ~0.5 MB.
+            wallpaper = _cover_fit(wallpaper, (WIDTH, HEIGHT))
             # Prefer COSMIC accent when available; still take secondary from wallpaper
             if not accent_hex:
                 accent = extracted[0]
@@ -1196,13 +1218,24 @@ def draw_corner_marks(draw, box, color):
 MAIN_CLOCK_CROP = (16, 6, 380, 82)
 
 
-def render_dashboard(now, last_notification=None):
-    """MAIN mode: wallpaper-first desktop HUD matching GAMER/MULTIMEDIA energy."""
+_DASHBOARD_BASE_CACHE: tuple[str, Image.Image] | None = None
+
+
+def _dashboard_base(theme: dict) -> Image.Image:
+    """Static MAIN backdrop (wallpaper, wash, border, scrims), cached per theme.
+
+    The clock is redrawn every second; rebuilding the backdrop each time cost
+    ~200 ms of CPU. Only the text layers change, so build this once per theme
+    fingerprint and hand out copies.
+    """
+    global _DASHBOARD_BASE_CACHE
     from PIL import ImageEnhance
 
-    theme = load_system_theme()
+    key = theme.get("fingerprint", "")
+    if _DASHBOARD_BASE_CACHE is not None and _DASHBOARD_BASE_CACHE[0] == key:
+        return _DASHBOARD_BASE_CACHE[1].copy()
+
     accent = tuple(theme["accent"])
-    accent2 = tuple(theme["accent2"])
     ar, ag, ab = accent
 
     if theme.get("wallpaper") is not None:
@@ -1227,28 +1260,49 @@ def render_dashboard(now, last_notification=None):
     image_rgb = image.convert("RGB")
     draw = ImageDraw.Draw(image_rgb)
     draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=accent, width=3)
-
-    clock = now.strftime("%H:%M:%S")
-    clock_font = font(FONT_MONO, 50)
-    draw.text((24, 47), clock, font=clock_font, fill=(0, 0, 0), anchor="lm")
-    draw.text((22, 45), clock, font=clock_font, fill=WHITE, anchor="lm")
-
-    # Date without year; weekday raised into the freed row
-    date_str = now.strftime("%d %b").upper()
-    day_str = now.strftime("%A").upper()
-    draw.text((446, 16), date_str, font=font(FONT_BOLD, 28), fill=accent, anchor="ra")
-    draw.text((446, 48), day_str, font=font(FONT_MEDIUM, 22), fill=accent2, anchor="ra")
-
     draw.rectangle((22, 90, 458, 93), fill=accent)
 
     note_scrim = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     ImageDraw.Draw(note_scrim).rounded_rectangle((14, 100, 466, 308), radius=16, fill=(0, 0, 0, 140))
     image_rgb = Image.alpha_composite(image_rgb.convert("RGBA"), note_scrim).convert("RGB")
+
+    _DASHBOARD_BASE_CACHE = (key, image_rgb)
+    return image_rgb.copy()
+
+
+_DASHBOARD_BODY_CACHE: tuple[tuple, Image.Image] | None = None
+
+
+def _dashboard_body(theme: dict, now, last_notification) -> Image.Image:
+    """Backdrop + weather / notification panel, cached until its inputs change.
+
+    ~90 text draws (the rain timeline alone is ~30 ms) that only change per
+    hour, per weather refresh or per notification — not per second.
+    """
+    global _DASHBOARD_BODY_CACHE
+    accent = tuple(theme["accent"])
+    accent2 = tuple(theme["accent2"])
+
+    weather = fetch_weather() if last_notification is None else None
+    has_weather = weather is not None and weather.ok
+    key = (
+        theme.get("fingerprint", ""),
+        id(last_notification),
+        getattr(last_notification, "received_at", None),
+        id(weather),
+        _WEATHER_FETCHED_AT,
+        now.hour,
+        # no-weather fallback prints HH:MM; keep it fresh per minute
+        None if (has_weather or last_notification is not None) else now.strftime("%H:%M"),
+    )
+    if _DASHBOARD_BODY_CACHE is not None and _DASHBOARD_BODY_CACHE[0] == key:
+        return _DASHBOARD_BODY_CACHE[1].copy()
+
+    image_rgb = _dashboard_base(theme)
     draw = ImageDraw.Draw(image_rgb)
 
     if last_notification is None:
-        weather = fetch_weather()
-        if weather is not None and weather.ok:
+        if has_weather:
             # Hero: glyph + large temp; condition top-right; compact meta; rain strip
             icon_box = (26, 110, 80, 164)
             _draw_weather_icon(draw, icon_box, weather.weather_code, accent)
@@ -1347,6 +1401,30 @@ def render_dashboard(now, last_notification=None):
         for line in body:
             draw.text((144, body_y), line, font=body_font, fill=(230, 232, 240))
             body_y += 28
+
+    _DASHBOARD_BODY_CACHE = (key, image_rgb)
+    return image_rgb.copy()
+
+
+def render_dashboard(now, last_notification=None):
+    """MAIN mode: wallpaper-first desktop HUD matching GAMER/MULTIMEDIA energy."""
+    theme = load_system_theme()
+    accent = tuple(theme["accent"])
+    accent2 = tuple(theme["accent2"])
+
+    image_rgb = _dashboard_body(theme, now, last_notification)
+    draw = ImageDraw.Draw(image_rgb)
+
+    clock = now.strftime("%H:%M:%S")
+    clock_font = font(FONT_MONO, 50)
+    draw.text((24, 47), clock, font=clock_font, fill=(0, 0, 0), anchor="lm")
+    draw.text((22, 45), clock, font=clock_font, fill=WHITE, anchor="lm")
+
+    # Date without year; weekday raised into the freed row
+    date_str = now.strftime("%d %b").upper()
+    day_str = now.strftime("%A").upper()
+    draw.text((446, 16), date_str, font=font(FONT_BOLD, 28), fill=accent, anchor="ra")
+    draw.text((446, 48), day_str, font=font(FONT_MEDIUM, 22), fill=accent2, anchor="ra")
 
     return image_rgb
 
@@ -2057,6 +2135,18 @@ if __name__ == "__main__":
                             continue
                         last_soft_nudge_at = current_time
 
+                # Pull in anything forwarded by a remote host agent (Windows/Ubuntu)
+                # and feed it through the same queue/pipeline as local notifications —
+                # dedup, WhatsApp redaction, overlay/retention all apply unchanged.
+                for remote_note in pop_remote_notifications():
+                    _enqueue_notification(
+                        remote_note.get("app", "App"),
+                        "",
+                        remote_note.get("title", ""),
+                        remote_note.get("body", ""),
+                        "",
+                    )
+
                 # --- Notifications: never show overlays while LOCKED ---
                 if mode_manager.state.current_mode == Mode.LOCKED:
                     drained = None
@@ -2124,7 +2214,9 @@ if __name__ == "__main__":
                     last_soft_nudge_at = current_time
                     logger.info("Periodic soft nudge (brightness + redraw)")
                     try:
-                        lcd._wake_panel()
+                        # No SetOrientation here: on Rev A it scrambles the
+                        # framebuffer (see _wake_panel docstring).
+                        lcd._wake_panel(set_orientation=False)
                         redraw_current_mode(lcd, mode_manager, now, last_notification)
                     except (serial.SerialException, OSError) as nudge_exc:
                         raise serial.SerialException(f"nudge failed: {nudge_exc}") from nudge_exc

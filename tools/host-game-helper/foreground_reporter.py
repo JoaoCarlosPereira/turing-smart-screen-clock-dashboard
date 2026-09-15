@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Announce the active game on the Windows host to the Turing clock on the LAN.
+"""Announce game/media/lock state on the Windows host to the Turing clock on the LAN.
 
 Zero-config for the Mini-PC: broadcasts UDP; the clock listens automatically.
 When the focused window is a shell/terminal, falls back to a running known game
 process so opening Palworld still works if the helper console has focus.
 
-Stdlib + ctypes only. Windows only.
+Game detection stays stdlib + ctypes only, always available. Media (now-playing)
+and notification forwarding use the optional WinRT packages installed by
+install-host-helper.ps1 (winrt-Windows.Media.Control /
+winrt-Windows.UI.Notifications.Management) — if those are missing or the user
+declines the one-time "Notification access" prompt, this script still runs and
+still reports the foreground game, it just skips media/notifications.
+
+Windows only.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import asyncio
 import os
-import socket
 import sys
 import threading
 import time
@@ -26,6 +32,9 @@ if sys.platform != "win32":
 
 import ctypes
 from ctypes import wintypes
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common  # noqa: E402  (needs sys.path tweak above when double-clicked from elsewhere)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -64,36 +73,10 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-DEFAULT_PORT = 8787
-MULTICAST_GROUP = "239.255.87.87"
-SERVICE_NAME = "turing-host-game"
-
-# Prefer these when the focused window is a shell / helper UI.
-KNOWN_GAME_STEMS = (
-    "palworld",
-    "palworld-win64-shipping",
-    "cs2",
-    "csgo",
-    "r5apex",
-    "fortniteclient-win64-shipping",
-    "valorant",
-    "valorant-win64-shipping",
-    "rocketleague",
-    "gta5",
-    "gtav",
-    "rdr2",
-    "eldenring",
-    "cyberpunk2077",
-    "dota2",
-    "hl2",
-    "tf2",
-    "bg3",
-    "bg3_dx11",
-    "starfield",
-    "overwatch",
-    "modernwarfare",
-    "cod",
-)
+DEFAULT_PORT = common.DEFAULT_PORT
+MULTICAST_GROUP = common.MULTICAST_GROUP
+SERVICE_NAME = common.SERVICE_NAME
+KNOWN_GAME_STEMS = common.KNOWN_GAME_STEMS
 
 BORING_EXE_STEMS = {
     "cmd",
@@ -152,6 +135,9 @@ _STATE = {
 }
 _LAST_LOG = ""
 
+HOST_ID = common.get_or_create_host_id()
+HOSTNAME = os.environ.get("COMPUTERNAME", "") or ""
+
 
 def _window_title(hwnd: int) -> str:
     length = user32.GetWindowTextLengthW(hwnd)
@@ -191,10 +177,7 @@ def _is_boring(title: str, exe: str) -> bool:
 
 
 def _known_game_hit(name: str) -> bool:
-    stem = Path(name).stem.lower()
-    if stem in KNOWN_GAME_STEMS:
-        return True
-    return any(key in stem for key in KNOWN_GAME_STEMS if len(key) >= 4)
+    return common.known_game_hit(name)
 
 
 def _iter_processes():
@@ -334,42 +317,172 @@ def sample_foreground() -> dict:
     return payload
 
 
-def _make_udp_socket() -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-    return sock
+# ---------------------------------------------------------------------------
+# Lock state — stdlib + ctypes only, always available (no WinRT dependency).
+# ---------------------------------------------------------------------------
+
+DESKTOP_SWITCHDESKTOP = 0x0100
+user32.OpenInputDesktop.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+user32.OpenInputDesktop.restype = wintypes.HDESK
+user32.CloseDesktop.argtypes = (wintypes.HDESK,)
+user32.CloseDesktop.restype = wintypes.BOOL
 
 
-def announce(sock: socket.socket, payload: dict, port: int) -> None:
-    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+def sample_lock() -> bool | None:
+    """Best-effort: the input desktop can't be opened while the session is locked."""
     try:
-        sock.sendto(raw, ("255.255.255.255", port))
-    except OSError:
-        pass
+        hdesk = user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    except Exception:
+        return None
+    if not hdesk:
+        return True
+    user32.CloseDesktop(hdesk)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Media (now-playing) + notifications — optional WinRT packages.
+# `pip install winrt-Windows.Media.Control winrt-Windows.UI.Notifications.Management`
+# (installed best-effort by install-host-helper.ps1). Missing/denied → skipped,
+# game detection above is unaffected either way.
+# ---------------------------------------------------------------------------
+
+_WINRT_MEDIA_AVAILABLE = False
+_WINRT_NOTIFICATIONS_AVAILABLE = False
+_winrt_media_state: dict = {}
+_winrt_media_lock = threading.Lock()
+_pending_notifications: list[dict] = []
+_pending_notifications_lock = threading.Lock()
+
+try:
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as _PlaybackStatus,
+    )
+
+    _WINRT_MEDIA_AVAILABLE = True
+except Exception as exc:  # ImportError or any WinRT init failure
+    print(f"(media forwarding disabled: {exc})", flush=True)
+
+try:
+    from winrt.windows.ui.notifications.management import UserNotificationListener as _NotifListener
+    from winrt.windows.ui.notifications import NotificationKinds as _NotificationKinds
+
+    _WINRT_NOTIFICATIONS_AVAILABLE = True
+except Exception as exc:
+    print(f"(notification forwarding disabled: {exc})", flush=True)
+
+
+async def _read_media_session() -> dict | None:
+    manager = await _MediaManager.request_async()
+    session = manager.get_current_session()
+    if session is None:
+        return None
     try:
-        sock.sendto(raw, (MULTICAST_GROUP, port))
-    except OSError:
-        pass
+        props = await session.try_get_media_properties_async()
+    except Exception:
+        return None
+    timeline = session.get_timeline_properties()
+    playback = session.get_playback_info()
+    is_playing = bool(playback and playback.playback_status == _PlaybackStatus.PLAYING)
+    return {
+        "title": str(props.title or ""),
+        "artist": str(props.artist or ""),
+        "album": str(props.album_title or ""),
+        "is_playing": is_playing,
+        "position": timeline.position.total_seconds() if timeline else 0.0,
+        "length": timeline.end_time.total_seconds() if timeline else 0.0,
+        "player_id": "winrt",
+    }
 
 
-def poll_and_announce(interval: float, port: int) -> None:
-    global _LAST_LOG
-    sock = _make_udp_socket()
+def sample_media() -> dict | None:
+    if not _WINRT_MEDIA_AVAILABLE:
+        return None
+    with _winrt_media_lock:
+        return dict(_winrt_media_state) if _winrt_media_state else None
+
+
+def _media_poll_loop(interval: float) -> None:
+    """Dedicated asyncio loop for the WinRT media API (own thread — avoids mixing
+    asyncio with the plain synchronous polling loop below)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     while True:
         try:
-            sample = sample_foreground()
-            with _STATE_LOCK:
-                _STATE.update(sample)
-            announce(sock, sample, port)
-            label = sample.get("title") or Path(str(sample.get("exe") or "")).stem or "?"
-            if label != _LAST_LOG:
-                _LAST_LOG = label
-                print(f"announcing: {label}", flush=True)
+            info = loop.run_until_complete(_read_media_session())
         except Exception as exc:
-            print(f"sample error: {exc}", flush=True)
-        time.sleep(max(0.2, interval))
+            print(f"(media poll error: {exc})", flush=True)
+            info = None
+        with _winrt_media_lock:
+            _winrt_media_state.clear()
+            if info:
+                _winrt_media_state.update(info)
+        time.sleep(max(0.5, interval))
+
+
+def _notification_to_text(notification) -> tuple[str, str, str]:
+    app_name = ""
+    try:
+        app_name = str(notification.app_info.display_info.display_name or "")
+    except Exception:
+        pass
+    title, body = "", ""
+    try:
+        toast_binding = notification.notification.visual.get_binding(
+            "ToastGeneric"
+        ) if notification.notification and notification.notification.visual else None
+        if toast_binding is not None:
+            texts = list(toast_binding.get_text_elements())
+            if texts:
+                title = str(texts[0].text or "")
+            if len(texts) > 1:
+                body = " ".join(str(t.text or "") for t in texts[1:]).strip()
+    except Exception:
+        pass
+    return app_name, title, body
+
+
+async def _notification_listener_loop() -> None:
+    listener = _NotifListener.get_current()
+    access = await listener.request_access_async()
+    if str(access) != "Allowed" and int(access) != 1:
+        print("(notification access not granted — run again and click Allow)", flush=True)
+        return
+    seen_ids: set[int] = set()
+    while True:
+        try:
+            notifications = await listener.get_notifications_async(_NotificationKinds.TOAST)
+            for note in notifications:
+                note_id = int(note.id)
+                if note_id in seen_ids:
+                    continue
+                seen_ids.add(note_id)
+                if len(seen_ids) > 200:
+                    seen_ids.clear()
+                app, title, body = _notification_to_text(note)
+                if not (title or body):
+                    continue
+                with _pending_notifications_lock:
+                    _pending_notifications.append({"app": app, "title": title, "body": body})
+        except Exception as exc:
+            print(f"(notification poll error: {exc})", flush=True)
+        await asyncio.sleep(1.0)
+
+
+def _notification_listener_thread() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_notification_listener_loop())
+    except Exception as exc:
+        print(f"(notification listener stopped: {exc})", flush=True)
+
+
+def _pop_pending_notifications() -> list[dict]:
+    with _pending_notifications_lock:
+        items, _pending_notifications[:] = list(_pending_notifications), []
+    return items
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -377,6 +490,8 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
+        import json
+
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -398,9 +513,47 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, status=404)
 
 
+def poll_and_announce(interval: float, port: int) -> None:
+    global _LAST_LOG
+    sock = common.make_udp_socket()
+    while True:
+        try:
+            game_sample = sample_foreground()
+            with _STATE_LOCK:
+                _STATE.update(game_sample)
+
+            game = None
+            if game_sample.get("title") or game_sample.get("exe"):
+                game = {
+                    "title": game_sample.get("title", ""),
+                    "exe": game_sample.get("exe", ""),
+                    "pid": game_sample.get("pid", 0),
+                }
+            media = sample_media()
+            lock_state = sample_lock()
+            lock = {"is_locked": lock_state} if lock_state is not None else None
+
+            payload = common.build_state_payload(HOST_ID, HOSTNAME, game=game, media=media, lock=lock)
+            common.send_payload(sock, payload, port)
+
+            for note in _pop_pending_notifications():
+                note_payload = common.build_notification_payload(
+                    HOST_ID, HOSTNAME, note["app"] or "Windows", note["title"], note["body"]
+                )
+                common.send_payload(sock, note_payload, port)
+
+            label = (game or {}).get("title") or Path(str((game or {}).get("exe") or "")).stem or "?"
+            if label != _LAST_LOG:
+                _LAST_LOG = label
+                print(f"announcing: {label}", flush=True)
+        except Exception as exc:
+            print(f"sample error: {exc}", flush=True)
+        time.sleep(max(0.2, interval))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Turing host game helper — auto-announces active game on the LAN"
+        description="Turing host game helper — auto-announces game/media/lock/notifications on the LAN"
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"UDP/HTTP port (default {DEFAULT_PORT})")
     parser.add_argument("--interval", type=float, default=1.0, help="Sample/announce interval seconds")
@@ -419,21 +572,35 @@ def main() -> int:
     with _STATE_LOCK:
         _STATE.update(sample)
 
-    thread = threading.Thread(
+    threading.Thread(
         target=poll_and_announce,
         args=(args.interval, args.port),
         name="turing-host-announce",
         daemon=True,
-    )
-    thread.start()
+    ).start()
+
+    if _WINRT_MEDIA_AVAILABLE:
+        threading.Thread(
+            target=_media_poll_loop, args=(args.interval,), name="turing-host-media", daemon=True
+        ).start()
+
+    if _WINRT_NOTIFICATIONS_AVAILABLE:
+        threading.Thread(
+            target=_notification_listener_thread, name="turing-host-notifications", daemon=True
+        ).start()
 
     print(
         f"turing-host-game-helper announcing on UDP {MULTICAST_GROUP}:{args.port} "
-        f"+ broadcast :{args.port}",
+        f"+ broadcast :{args.port} (host_id={HOST_ID[:8]}...)",
         flush=True,
     )
     print("Keep this running. Open your game (e.g. Palworld) — no Mini-PC config needed.", flush=True)
     print(f"now: {sample.get('title') or Path(str(sample.get('exe') or '')).stem}", flush=True)
+    print(
+        f"media forwarding: {'on' if _WINRT_MEDIA_AVAILABLE else 'off (winrt package missing)'}; "
+        f"notification forwarding: {'on' if _WINRT_NOTIFICATIONS_AVAILABLE else 'off (winrt package missing)'}",
+        flush=True,
+    )
 
     if args.http:
         server = ThreadingHTTPServer((args.http_host, args.port), Handler)

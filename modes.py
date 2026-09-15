@@ -8,6 +8,7 @@ GAMER (gaming overlay), and LOCKED (session lock — time + lock icon only).
 
 import json
 import os
+import queue
 import re
 import socket
 import struct
@@ -193,8 +194,15 @@ _HOST_GAME_HELPER_FAIL_TTL = 12.0
 _HOST_GAME_HELPER_DEFAULT_PORT = 8787
 _HOST_GAME_HELPER_MULTICAST = "239.255.87.87"
 _HOST_GAME_HELPER_SERVICE = "turing-host-game"
-_HOST_GAME_UDP_CACHE: Optional[dict] = None
-_HOST_GAME_UDP_CACHE_MONO: float = 0.0
+
+# Per-host registry (protocol v2): each remote agent (Windows/Linux) gets its own
+# slot keyed by host_id, instead of a single last-writer-wins cache — lets several
+# PCs report concurrently without clobbering each other.
+_REMOTE_HOST_REGISTRY: dict[str, dict] = {}
+_REMOTE_HOST_REGISTRY_LOCK = threading.Lock()
+_REMOTE_HOST_STALE_SECONDS = 10.0
+_REMOTE_NOTIFICATION_QUEUE: "queue.Queue[dict]" = queue.Queue()
+
 _HOST_GAME_UDP_LOCK = threading.Lock()
 _HOST_GAME_UDP_THREAD: Optional[threading.Thread] = None
 
@@ -721,38 +729,205 @@ def _host_game_helper_base_urls(hosts: list[dict]) -> list[str]:
     return urls
 
 
+def _prune_stale_remote_hosts(now_mono: Optional[float] = None) -> None:
+    now_mono = now_mono if now_mono is not None else time.monotonic()
+    with _REMOTE_HOST_REGISTRY_LOCK:
+        stale = [
+            host_id
+            for host_id, entry in _REMOTE_HOST_REGISTRY.items()
+            if now_mono - entry["last_seen_mono"] > _REMOTE_HOST_STALE_SECONDS
+        ]
+        for host_id in stale:
+            del _REMOTE_HOST_REGISTRY[host_id]
+
+
+def _live_remote_hosts() -> list[dict]:
+    """Fresh registry entries (protocol v2 + legacy v1 hosts), newest first."""
+    _prune_stale_remote_hosts()
+    with _REMOTE_HOST_REGISTRY_LOCK:
+        entries = list(_REMOTE_HOST_REGISTRY.values())
+    entries.sort(key=lambda entry: entry["last_seen_mono"], reverse=True)
+    return entries
+
+
 def _host_game_udp_payload_fresh(max_age: float = 5.0) -> Optional[dict]:
-    with _HOST_GAME_UDP_LOCK:
-        if not _HOST_GAME_UDP_CACHE:
-            return None
-        age = time.monotonic() - _HOST_GAME_UDP_CACHE_MONO
-        if age > max_age:
-            return None
-        return dict(_HOST_GAME_UDP_CACHE)
+    now_mono = time.monotonic()
+    for entry in _live_remote_hosts():
+        if now_mono - entry["last_seen_mono"] > max_age:
+            continue
+        game = entry.get("game")
+        if not game:
+            continue
+        payload = dict(game)
+        payload["updated_at"] = time.time()
+        payload["source_ip"] = entry.get("source_ip", "")
+        return payload
+    return None
 
 
-def _accept_host_game_udp_payload(data: dict, source_ip: str = "") -> None:
-    global _HOST_GAME_UDP_CACHE, _HOST_GAME_UDP_CACHE_MONO, _HOST_GAME_HELPER_CACHE
+def _accept_host_state_payload(data: dict, source_ip: str) -> None:
+    """Upsert one remote host's game/media/lock slice (protocol v2, or legacy v1 bare game)."""
+    global _HOST_GAME_HELPER_CACHE
+    host_id = str(data.get("host_id") or "") or f"legacy:{source_ip or 'unknown'}"
+    hostname = str(data.get("hostname") or "")
+    now_mono = time.monotonic()
+
+    game_raw = data.get("game")
+    if not isinstance(game_raw, dict):
+        # v1 legacy: bare {title, exe, pid} at the payload's top level.
+        game_raw = (
+            {"title": data.get("title"), "exe": data.get("exe"), "pid": data.get("pid")}
+            if (data.get("title") or data.get("exe"))
+            else None
+        )
+
+    game = None
+    if isinstance(game_raw, dict) and (game_raw.get("title") or game_raw.get("exe")):
+        game = {
+            "title": str(game_raw.get("title") or ""),
+            "exe": str(game_raw.get("exe") or ""),
+            "pid": int(game_raw.get("pid") or 0),
+        }
+
+    media_raw = data.get("media")
+    media = None
+    if isinstance(media_raw, dict):
+        media = {
+            "title": str(media_raw.get("title") or ""),
+            "artist": str(media_raw.get("artist") or ""),
+            "album": str(media_raw.get("album") or ""),
+            "is_playing": bool(media_raw.get("is_playing")),
+            "position": float(media_raw.get("position") or 0.0),
+            "length": float(media_raw.get("length") or 0.0),
+            "player_id": str(media_raw.get("player_id") or ""),
+        }
+
+    lock_raw = data.get("lock")
+    lock = None
+    if isinstance(lock_raw, dict) and "is_locked" in lock_raw:
+        lock = {"is_locked": bool(lock_raw.get("is_locked"))}
+
+    # Require at least one real sub-object so an empty keepalive tick neither
+    # creates a bogus registry entry nor keeps an already-stale one alive.
+    if game is None and media is None and lock is None:
+        return
+
+    with _REMOTE_HOST_REGISTRY_LOCK:
+        entry = _REMOTE_HOST_REGISTRY.setdefault(
+            host_id,
+            {
+                "host_id": host_id,
+                "hostname": hostname,
+                "source_ip": source_ip,
+                "last_seen_mono": now_mono,
+                "game": None,
+                "media": None,
+                "lock": None,
+            },
+        )
+        entry["hostname"] = hostname or entry.get("hostname", "")
+        entry["source_ip"] = source_ip
+        entry["last_seen_mono"] = now_mono
+        # Empty keepalives only refresh last_seen — they never erase previously
+        # known state, mirroring the old cache's "do not clear on empty" rule.
+        if game is not None:
+            entry["game"] = game
+        if media is not None:
+            entry["media"] = media
+        if lock is not None:
+            entry["lock"] = lock
+
+    if game is not None:
+        # Keep the HTTP-fallback cache warm so _query_host_game_helper stays sync/fast.
+        legacy_payload = dict(game)
+        legacy_payload["updated_at"] = time.time()
+        legacy_payload["source_ip"] = source_ip
+        _HOST_GAME_HELPER_CACHE = (now_mono, legacy_payload)
+
+
+def _accept_host_notification_payload(data: dict) -> None:
+    app = str(data.get("app") or "").strip()
+    title = str(data.get("title") or "").strip()
+    body = str(data.get("body") or "").strip()
+    if not (title or body):
+        return
+    _REMOTE_NOTIFICATION_QUEUE.put({"app": app or "PC", "title": title, "body": body})
+
+
+def _accept_host_udp_payload(data: dict, source_ip: str = "") -> None:
     if not isinstance(data, dict):
         return
     service = str(data.get("service") or "")
     if service and service != _HOST_GAME_HELPER_SERVICE:
         return
-    # Require at least a title or exe so empty keepalives do not clear state
-    if not (data.get("title") or data.get("exe")):
+    kind = str(data.get("kind") or "state")
+    if kind == "notification":
+        _accept_host_notification_payload(data)
         return
-    payload = {
-        "title": str(data.get("title") or ""),
-        "exe": str(data.get("exe") or ""),
-        "pid": int(data.get("pid") or 0),
-        "updated_at": float(data.get("updated_at") or time.time()),
-        "source_ip": source_ip,
-    }
-    with _HOST_GAME_UDP_LOCK:
-        _HOST_GAME_UDP_CACHE = payload
-        _HOST_GAME_UDP_CACHE_MONO = time.monotonic()
-    # Keep HTTP-style cache warm so resolve path stays sync/fast
-    _HOST_GAME_HELPER_CACHE = (time.monotonic(), payload)
+    if kind != "state":
+        return
+    _accept_host_state_payload(data, source_ip)
+
+
+def pop_remote_notifications() -> list[dict]:
+    """Drain notifications forwarded by remote host agents (non-blocking).
+
+    Called by clock-display.py's main loop alongside its local dbus-monitor
+    queue drain — items are fed through the same _enqueue_notification path.
+    """
+    items: list[dict] = []
+    while True:
+        try:
+            items.append(_REMOTE_NOTIFICATION_QUEUE.get_nowait())
+        except queue.Empty:
+            break
+    return items
+
+
+def _remote_game_hit() -> Optional[dict]:
+    """Most-recently-updated remote host whose game passes the local trust list."""
+    for entry in _live_remote_hosts():
+        game = entry.get("game")
+        if not game:
+            continue
+        display_name, appid = _classify_helper_payload(game)
+        if not display_name:
+            continue
+        return {
+            "process": f"remote:{entry.get('hostname') or entry['host_id']}",
+            "display_name": display_name,
+            "pid": int(game.get("pid") or 0),
+            "appid": appid,
+        }
+    return None
+
+
+def _remote_media_hit() -> Optional["MultimediaInfo"]:
+    """Most-recently-updated remote host currently playing media."""
+    for entry in _live_remote_hosts():
+        media = entry.get("media")
+        if not media or not media.get("is_playing") or not media.get("title"):
+            continue
+        return MultimediaInfo(
+            title=media["title"],
+            artist=media.get("artist", ""),
+            album=media.get("album", ""),
+            app_name=entry.get("hostname") or entry["host_id"],
+            is_playing=True,
+            position=float(media.get("position") or 0.0),
+            length=float(media.get("length") or 0.0),
+            player_id=f"remote:{media.get('player_id') or entry['host_id']}",
+        )
+    return None
+
+
+def _remote_lock_hit() -> Optional[dict]:
+    """Most-recently-updated remote host currently locked."""
+    for entry in _live_remote_hosts():
+        lock = entry.get("lock")
+        if lock and lock.get("is_locked"):
+            return {"host_id": entry.get("hostname") or entry["host_id"]}
+    return None
 
 
 def _host_game_udp_loop(port: int) -> None:
@@ -788,7 +963,7 @@ def _host_game_udp_loop(port: int) -> None:
             data = json.loads(raw.decode("utf-8", "ignore"))
         except Exception:
             continue
-        _accept_host_game_udp_payload(data, source_ip=addr[0] if addr else "")
+        _accept_host_udp_payload(data, source_ip=addr[0] if addr else "")
 
 
 def _ensure_host_game_udp_listener() -> None:
@@ -1359,6 +1534,10 @@ def get_system_volume() -> tuple[float, bool]:
 # Multimedia detection (MPRIS2)
 # ---------------------------------------------------------------------------
 
+_YT_DURATION_CACHE: dict[str, tuple[float, Optional[float]]] = {}
+_YT_DURATION_FAIL_TTL = 120.0
+
+
 class MultimediaDetector:
     """Detects and retrieves media information via MPRIS2 D-Bus interface."""
 
@@ -1436,6 +1615,13 @@ class MultimediaDetector:
 
             self._last_info = found_info
             return found_info
+
+        # Nothing playing locally — fall back to a remote host agent's media state.
+        remote_info = _remote_media_hit()
+        if remote_info:
+            self._local_position = remote_info.position
+            self._last_info = remote_info
+            return remote_info
 
         # No playing media, but keep last info as paused
         self._last_info.is_playing = False
@@ -1652,7 +1838,12 @@ class MultimediaDetector:
 
     @staticmethod
     def _resolve_youtube_duration(url: str) -> Optional[float]:
-        """Resolve YouTube video duration in seconds by scraping video page."""
+        """Resolve YouTube video duration in seconds by scraping video page.
+
+        Cached per video id: the watch page is ~1 MB over TLS and this runs
+        on every detection tick (3 s) while a video plays. A failed lookup is
+        retried only after _YT_DURATION_FAIL_TTL seconds.
+        """
         if not url:
             return None
         try:
@@ -1669,6 +1860,23 @@ class MultimediaDetector:
             if not video_id:
                 return None
             video_id = video_id[0]
+            cached = _YT_DURATION_CACHE.get(video_id)
+            if cached is not None:
+                fetched_at, length = cached
+                if length is not None or time.monotonic() - fetched_at < _YT_DURATION_FAIL_TTL:
+                    return length
+            length = MultimediaDetector._fetch_youtube_duration(video_id)
+            _YT_DURATION_CACHE[video_id] = (time.monotonic(), length)
+            if len(_YT_DURATION_CACHE) > 64:
+                _YT_DURATION_CACHE.pop(next(iter(_YT_DURATION_CACHE)))
+            return length
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fetch_youtube_duration(video_id: str) -> Optional[float]:
+        try:
+            from urllib.request import Request, urlopen
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             req = Request(video_url, headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
@@ -1721,6 +1929,88 @@ class MultimediaDetector:
 # ---------------------------------------------------------------------------
 # Gamer detection
 # ---------------------------------------------------------------------------
+
+# One precompiled alternation instead of one re.search per (process × game).
+_KNOWN_GAME_TOKEN_RE = re.compile(
+    r"(^|[_\-.])(" + "|".join(
+        re.escape(k) for k in sorted(KNOWN_GAMES, key=len, reverse=True) if len(k) >= 5
+    ) + r")([_\-.]|$)"
+) if any(len(k) >= 5 for k in KNOWN_GAMES) else None
+
+
+def _proc_name_from_comm(pid: int, comm: str) -> str:
+    """Mirror psutil's Process.name(): /proc/<pid>/comm is truncated to 15 chars,
+    so fall back to basename(argv[0]) when it looks truncated."""
+    if len(comm) < 15:
+        return comm
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return comm
+    base = os.path.basename(argv0)
+    if base.startswith(comm):
+        return base
+    return comm
+
+
+def _iter_processes() -> list[tuple[int, int, str]]:
+    """Cheap (pid, ppid, name) scan straight from /proc.
+
+    psutil.process_iter(["name", "pid", "ppid"]) costs ~160 ms for ~550
+    processes and runs every 3 s; this is ~10x cheaper. psutil.Process is only
+    built for the handful of candidates that need cmdline/exe/sockets.
+    """
+    result: list[tuple[int, int, str]] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as fh:
+                stat = fh.read()
+        except OSError:
+            continue
+        lparen = stat.find(b"(")
+        rparen = stat.rfind(b")")
+        if lparen < 0 or rparen < 0:
+            continue
+        comm = stat[lparen + 1:rparen].decode("utf-8", "replace")
+        fields = stat[rparen + 2:].split(b" ", 2)
+        try:
+            ppid = int(fields[1])
+        except (IndexError, ValueError):
+            ppid = 0
+        result.append((pid, ppid, _proc_name_from_comm(pid, comm)))
+    return result
+
+
+class _LazyProc:
+    """psutil.Process built on first use (cmdline/exe/connections)."""
+
+    __slots__ = ("pid", "_proc")
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self._proc = None
+
+    def _real(self):
+        if self._proc is None:
+            self._proc = psutil.Process(self.pid)
+        return self._proc
+
+    def __getattr__(self, item):
+        return getattr(self._real(), item)
+
+
+def _process_handle(pid: int):
+    """Factory for per-candidate process handles (patched by tests)."""
+    return _LazyProc(pid)
+
 
 class GamerDetector:
     """Detects running games and gathers gaming metrics."""
@@ -1825,11 +2115,9 @@ class GamerDetector:
 
     def _detect_game(self) -> Optional[dict]:
         """Detect a running local game, Steam Remote Play, or Moonlight stream."""
-        # Cheap attrs first — cmdline/exe are expensive across all processes.
-        try:
-            procs = list(psutil.process_iter(["name", "pid", "ppid"]))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return None
+        # Cheap raw /proc scan first — psutil per-process objects only for
+        # candidates that need cmdline/exe/sockets.
+        procs = _iter_processes()
 
         stream_hit = None
         known_hit = None
@@ -1837,14 +2125,12 @@ class GamerDetector:
         moonlight_hosts = None
         moonlight_ips = None
 
-        for proc in procs:
-            proc_name = proc.info.get("name") or ""
+        for pid, ppid, proc_name in procs:
             proc_lower = proc_name.lower()
-            pid = proc.info.get("pid")
-            ppid = proc.info.get("ppid")
 
             if not proc_lower or pid < 200 or ppid in (0, 2):
                 continue
+            proc = _process_handle(pid)
             if proc_lower in NON_GAME_PROCESSES or Path(proc_lower).stem in NON_GAME_PROCESSES:
                 continue
 
@@ -1921,18 +2207,15 @@ class GamerDetector:
                 }
                 break
 
-            for game_key, display_name in KNOWN_GAMES.items():
-                if len(game_key) < 5:
-                    continue
-                if re.search(rf"(^|[_\-.]){re.escape(game_key)}([_\-.]|$)", proc_lower):
-                    known_hit = {
-                        "process": proc_name,
-                        "display_name": display_name,
-                        "pid": pid,
-                        "appid": KNOWN_GAME_APPIDS.get(game_key, ""),
-                    }
-                    break
-            if known_hit:
+            token_match = _KNOWN_GAME_TOKEN_RE.search(proc_lower) if _KNOWN_GAME_TOKEN_RE else None
+            if token_match:
+                game_key = token_match.group(2)
+                known_hit = {
+                    "process": proc_name,
+                    "display_name": KNOWN_GAMES[game_key],
+                    "pid": pid,
+                    "appid": KNOWN_GAME_APPIDS.get(game_key, ""),
+                }
                 break
 
         if known_hit and not known_hit.get("appid"):
@@ -1943,7 +2226,16 @@ class GamerDetector:
             moonlight_hit["appid"] = _appid_for_process(
                 moonlight_hit["process"], moonlight_hit["display_name"]
             )
-        return known_hit or stream_hit or moonlight_hit
+        if known_hit or stream_hit or moonlight_hit:
+            return known_hit or stream_hit or moonlight_hit
+
+        # No local/Moonlight hit — fall back to any remote host agent (Windows or
+        # Ubuntu) reporting a recognized game. On a Mini-PC with no Moonlight client
+        # of its own, this is the only path into GAMER mode.
+        remote_hit = _remote_game_hit()
+        if remote_hit and not remote_hit.get("appid"):
+            remote_hit["appid"] = _appid_for_process(remote_hit["process"], remote_hit["display_name"])
+        return remote_hit
 
     def _gather_gamer_metrics(self, info: GamerInfo, pid: Optional[int] = None):
         """Gather system-wide CPU/GPU usage and temperatures."""
@@ -2056,7 +2348,15 @@ class LockDetector:
         self._last_info = LockInfo()
 
     def detect(self) -> LockInfo:
-        """Return current lock state (best-effort across desktop environments)."""
+        """Return current lock state (best-effort across desktop environments).
+
+        Local session state is authoritative and wins immediately when locked.
+        When local reports unlocked (or nothing at all), a remote host agent's
+        lock state is checked next, so a locked Windows/Ubuntu PC can still
+        drive LOCKED mode on a Mini-PC with no local session lock of its own.
+        """
+        local_result: Optional[bool] = None
+        local_source = ""
         for checker, source in (
             (self._locked_via_logind, "logind"),
             (self._locked_via_gnome_screensaver, "gnome"),
@@ -2069,7 +2369,22 @@ class LockDetector:
                 continue
             if result is None:
                 continue
-            info = LockInfo(is_locked=bool(result), source=source)
+            local_result, local_source = bool(result), source
+            break
+
+        if local_result:
+            info = LockInfo(is_locked=True, source=local_source)
+            self._last_info = info
+            return info
+
+        remote_hit = _remote_lock_hit()
+        if remote_hit:
+            info = LockInfo(is_locked=True, source=f"remote:{remote_hit['host_id']}")
+            self._last_info = info
+            return info
+
+        if local_result is not None:
+            info = LockInfo(is_locked=False, source=local_source)
             self._last_info = info
             return info
         return self._last_info
@@ -2569,14 +2884,24 @@ def _draw_lock_icon(draw, cx: int, cy: int, color: tuple, scale: float = 1.0):
     )
 
 
-def render_locked_mode(now: datetime, theme: Optional[dict] = None) -> object:
-    """Minimal lock screen: OS-themed backdrop, lock icon, time only."""
+_LOCKED_BASE_CACHE: tuple[tuple, object] | None = None
+
+
+def _locked_base(theme: dict):
+    """Static LOCKED backdrop (wallpaper, vignette, border, lock icon), cached.
+
+    Redrawn every second for the clock; the backdrop itself only changes with
+    the desktop theme, so build it once per fingerprint and return copies.
+    """
+    global _LOCKED_BASE_CACHE
     from PIL import Image, ImageDraw, ImageEnhance
 
-    theme = theme or {}
     accent = tuple(theme.get("accent") or _CYAN)
-    accent2 = tuple(theme.get("accent2") or _BLUE)
     wallpaper = theme.get("wallpaper")
+    key = (theme.get("fingerprint", ""), accent, wallpaper is not None)
+    if _LOCKED_BASE_CACHE is not None and _LOCKED_BASE_CACHE[0] == key:
+        return _LOCKED_BASE_CACHE[1].copy()
+
     ar, ag, ab = accent
 
     if wallpaper is not None:
@@ -2610,6 +2935,20 @@ def render_locked_mode(now: datetime, theme: Optional[dict] = None) -> object:
 
     # Lock icon
     _draw_lock_icon(draw, _WIDTH // 2, 88, accent, scale=1.15)
+
+    _LOCKED_BASE_CACHE = (key, image_rgb)
+    return image_rgb.copy()
+
+
+def render_locked_mode(now: datetime, theme: Optional[dict] = None) -> object:
+    """Minimal lock screen: OS-themed backdrop, lock icon, time only."""
+    from PIL import ImageDraw
+
+    theme = theme or {}
+    accent2 = tuple(theme.get("accent2") or _BLUE)
+
+    image_rgb = _locked_base(theme)
+    draw = ImageDraw.Draw(image_rgb)
 
     # Time only (large, centered)
     clock = now.strftime("%H:%M:%S")

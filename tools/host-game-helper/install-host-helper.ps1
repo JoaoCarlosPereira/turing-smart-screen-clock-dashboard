@@ -35,6 +35,17 @@ if (-not $Python) {
     $argument = "`"$reporter`" --port $Port"
 }
 
+try {
+    & $Python -m pip install --quiet --upgrade `
+        winrt-Windows.Media.Control `
+        winrt-Windows.UI.Notifications.Management `
+        winrt-Windows.Foundation `
+        winrt-Windows.Storage.Streams
+    Write-Host "OK: pacotes WinRT instalados (media/notificacoes habilitados)."
+} catch {
+    Write-Warning "Pacotes WinRT opcionais falharam ($_) — deteccao de jogo continua funcionando; media/notificacoes ficam desativados. Rode este script de novo depois para tentar novamente."
+}
+
 $action = New-ScheduledTaskAction -Execute $Python -Argument $argument -WorkingDirectory $scriptDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `

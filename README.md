@@ -28,7 +28,7 @@ Este fork adiciona uma experiência dedicada de relógio e monitoramento para Li
 - **MULTIMEDIA**: faixa atual, artista, capa, progresso e volume via MPRIS2.
 - **GAMER**: arte, tempo de sessão e métricas de hardware para jogos locais e Steam Remote Play.
 - **LOCKED**: relógio com brilho reduzido quando a sessão está bloqueada.
-- **PCs remotos**: o `tools/host-game-helper/foreground_reporter.py` roda no PC Windows e anuncia o software/jogo aberto via UDP broadcast e multicast; o dashboard recebe os dados automaticamente na porta `8787`.
+- **PCs remotos**: o agente em `tools/host-game-helper/` (Windows: `foreground_reporter.py`; Ubuntu: `linux_reporter.py`) roda em um ou mais PCs remotos e anuncia jogo/mídia/bloqueio/notificações via UDP broadcast e multicast; o dashboard recebe os dados automaticamente na porta `8787`, rastreando cada host separadamente.
 - **Serviços Linux**: scripts opcionais para iniciar o relógio, reconectar Bluetooth e encaminhar mensagens do iPhone como notificações do desktop.
 
 Para o fluxo completo de instalação e operação, consulte [RELOGIO.md](RELOGIO.md).

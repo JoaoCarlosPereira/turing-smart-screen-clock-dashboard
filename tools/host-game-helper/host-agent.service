@@ -1,0 +1,14 @@
+[Unit]
+Description=Turing host agent (game/media/lock/notifications on the LAN)
+After=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/turing-host-agent/bin/linux_reporter.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target graphical-session.target
