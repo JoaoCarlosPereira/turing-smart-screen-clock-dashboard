@@ -312,6 +312,26 @@ class TestDetectGameGatesOnIsGame(unittest.TestCase):
         hit = _run_detect_game([], helper_payload=None)
         self.assertIsNone(hit)
 
+    def test_remote_registry_icarus_enters(self):
+        modes._REMOTE_HOST_REGISTRY["host-win"] = {
+            "host_id": "04281b00d63d4028b7e62ea797a4afa2",
+            "hostname": "DESKTOP-977SM5E",
+            "source_ip": "192.168.2.177",
+            "last_seen_mono": modes.time.monotonic(),
+            "game": {
+                "title": "Icarus-3.0.29.157838-Shipping-DangerousHorizons",
+                "exe": r"D:\SteamLibrary\steamapps\common\Icarus\Icarus\Binaries\Win64\Icarus-Win64-Shipping.exe",
+                "pid": 11676,
+            },
+            "media": None,
+            "lock": None,
+        }
+        hit = _run_detect_game([], helper_payload=None)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["display_name"], "Icarus")
+        self.assertEqual(hit["appid"], "1149460")
+
 
 if __name__ == "__main__":
     unittest.main()
+

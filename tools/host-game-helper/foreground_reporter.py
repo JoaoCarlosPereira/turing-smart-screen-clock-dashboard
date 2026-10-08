@@ -204,6 +204,8 @@ def _friendly_game_title(title: str, exe: str) -> str:
     aliases = {
         "palworld": "Palworld",
         "palworld-win64-shipping": "Palworld",
+        "icarus": "Icarus",
+        "icarus-win64-shipping": "Icarus",
         "cs2": "Counter-Strike 2",
         "csgo": "Counter-Strike 2",
         "valorant": "Valorant",

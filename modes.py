@@ -85,6 +85,7 @@ class GamerInfo:
     gpu_temp: float = 0.0
     memory_usage: float = 0.0  # system RAM percent 0-100
     display_memory: str = ""
+    remote_metrics: dict = field(default_factory=dict)
     uptime: str = ""
     elapsed: str = ""
     detected_at: Optional[datetime] = None
@@ -146,6 +147,8 @@ KNOWN_GAMES = {
     "hogwartslegacy": "Hogwarts Legacy",
     "palworld": "Palworld",
     "palworld-win64-shipping": "Palworld",
+    "icarus": "Icarus",
+    "icarus-win64-shipping": "Icarus",
     "left4dead2": "Left 4 Dead 2",
     "tf2": "Team Fortress 2",
     "bg3": "Baldur's Gate 3",
@@ -154,6 +157,15 @@ KNOWN_GAMES = {
     "civilizationvi": "Civilization VI",
     "dota2": "Dota 2",
     "hl2": "Half-Life 2",
+    "helldivers2": "Helldivers 2",
+    "valheim": "Valheim",
+    "satisfactory": "Satisfactory",
+    "subnautica": "Subnautica",
+    "rust": "Rust",
+    "rustclient": "Rust",
+    "terraria": "Terraria",
+    "stardewvalley": "Stardew Valley",
+    "lethalcompany": "Lethal Company",
 }
 
 # Never treat these as games (Steam UI / helpers always running)
@@ -251,6 +263,21 @@ STEAM_APP_NAMES = {
     "1938090": "Call of Duty",
     "2357570": "Overwatch 2",
     "420": "Half-Life 2",
+    "1149460": "Icarus",
+    "1716740": "Starfield",
+    "1593500": "God of War Ragnarök",
+    "1817070": "Marvel's Spider-Man",
+    "990080": "Hogwarts Legacy",
+    "281990": "Stellaris",
+    "289070": "Civilization VI",
+    "553850": "Helldivers 2",
+    "892970": "Valheim",
+    "526870": "Satisfactory",
+    "264710": "Subnautica",
+    "252490": "Rust",
+    "105600": "Terraria",
+    "413150": "Stardew Valley",
+    "1966720": "Lethal Company",
 }
 
 # Process stem → Steam AppID (for local launches without streaming_client)
@@ -269,12 +296,29 @@ KNOWN_GAME_APPIDS = {
     "cyberpunk2077": "1091500",
     "palworld": "1623730",
     "palworld-win64-shipping": "1623730",
+    "icarus": "1149460",
+    "icarus-win64-shipping": "1149460",
     "bg3": "1086940",
     "baldur": "1086940",
     "overwatch": "2357570",
     "overwatch2": "2357570",
     "ow2": "2357570",
     "hl2": "420",
+    "starfield": "1716740",
+    "godofwar": "1593500",
+    "spiderman": "1817070",
+    "hogwartslegacy": "990080",
+    "stellaris": "281990",
+    "civilizationvi": "289070",
+    "helldivers2": "553850",
+    "valheim": "892970",
+    "satisfactory": "526870",
+    "subnautica": "264710",
+    "rust": "252490",
+    "rustclient": "252490",
+    "terraria": "105600",
+    "stardewvalley": "413150",
+    "lethalcompany": "1966720",
 }
 
 STEAM_NAME_CACHE_PATH = Path.home() / ".cache" / "turing-clock" / "steam-app-names.json"
@@ -813,6 +857,40 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
     if isinstance(lock_raw, dict) and "is_locked" in lock_raw:
         lock = {"is_locked": bool(lock_raw.get("is_locked"))}
 
+    metrics_raw = data.get("metrics")
+    metrics = None
+    if isinstance(metrics_raw, dict):
+        metrics = {}
+        for key in ("gpu_temp", "gpu_usage", "cpu_temp", "cpu_usage", "memory_usage", "fps"):
+            if key not in metrics_raw:
+                continue
+            try:
+                metrics[key] = float(metrics_raw[key])
+            except (TypeError, ValueError):
+                pass
+        for vram_key in ("display_memory", "vram", "vram_display"):
+            if metrics_raw.get(vram_key):
+                metrics["display_memory"] = str(metrics_raw[vram_key])
+                break
+
+    # Also accept fps and vram if placed at top-level or under game
+    fps_cand = data.get("fps") or (game_raw.get("fps") if isinstance(game_raw, dict) else None)
+    if fps_cand is not None:
+        try:
+            if metrics is None:
+                metrics = {}
+            metrics["fps"] = float(fps_cand)
+        except (TypeError, ValueError):
+            pass
+
+    vram_cand = data.get("vram") or data.get("display_memory") or (game_raw.get("vram") if isinstance(game_raw, dict) else None)
+    if vram_cand is not None and (metrics is None or "display_memory" not in metrics):
+        if metrics is None:
+            metrics = {}
+        metrics["display_memory"] = str(vram_cand)
+
+    if not metrics:
+        metrics = None
     desktop_raw = data.get("desktop")
     desktop = None
     if isinstance(desktop_raw, dict) and desktop_raw.get("wallpaper_id"):
@@ -824,7 +902,7 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
 
     # Require at least one real sub-object so an empty keepalive tick neither
     # creates a bogus registry entry nor keeps an already-stale one alive.
-    if game is None and media is None and lock is None and desktop is None:
+    if game is None and media is None and lock is None and desktop is None and metrics is None:
         return
 
     with _REMOTE_HOST_REGISTRY_LOCK:
@@ -839,6 +917,7 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
                 "media": None,
                 "lock": None,
                 "desktop": None,
+                "metrics": None,
             },
         )
         entry["hostname"] = hostname or entry.get("hostname", "")
@@ -854,6 +933,8 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
             entry["lock"] = lock
         if desktop is not None:
             entry["desktop"] = desktop
+        if metrics is not None:
+            entry["metrics"] = metrics
 
     if game is not None:
         # Keep the HTTP-fallback cache warm so _query_host_game_helper stays sync/fast.
@@ -916,6 +997,7 @@ def _remote_game_hit() -> Optional[dict]:
             "display_name": display_name,
             "pid": int(game.get("pid") or 0),
             "appid": appid,
+            "remote_metrics": dict(entry.get("metrics") or {}),
         }
     return None
 
@@ -1150,6 +1232,12 @@ def _clean_foreground_title(title: str, exe: str = "") -> str:
                 raw = left
                 break
 
+    ue_match = re.match(r"^([A-Za-z0-9_]+)-\d+\.\d+.*?-Shipping", raw, re.IGNORECASE)
+    if ue_match:
+        cand = ue_match.group(1).strip()
+        if len(cand) >= 3 and cand.lower() not in _FOREGROUND_TITLE_IGNORE:
+            raw = cand
+
     raw = re.sub(r"\s+\(\d+\s*[\-–—]?\s*bit\)$", "", raw, flags=re.IGNORECASE).strip()
     raw = re.sub(r"\s+\[.*?\]$", "", raw).strip()
     if raw.lower() in _FOREGROUND_TITLE_IGNORE:
@@ -1172,6 +1260,28 @@ _BORING_FOREGROUND_STEMS = {
 }
 
 
+def _load_custom_games() -> dict[str, str]:
+    try:
+        from library.config import CONFIG_DATA
+        custom = (CONFIG_DATA.get("config") or {}).get("CUSTOM_GAMES") or {}
+        if isinstance(custom, dict):
+            return {str(k).lower(): str(v) for k, v in custom.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _load_custom_game_appids() -> dict[str, str]:
+    try:
+        from library.config import CONFIG_DATA
+        custom = (CONFIG_DATA.get("config") or {}).get("CUSTOM_GAME_APPIDS") or {}
+        if isinstance(custom, dict):
+            return {str(k).lower(): str(v) for k, v in custom.items()}
+    except Exception:
+        pass
+    return {}
+
+
 def _match_game_name_from_text(text: str) -> tuple[str, str]:
     """Match a free-text label against known games / Steam names.
 
@@ -1180,6 +1290,11 @@ def _match_game_name_from_text(text: str) -> tuple[str, str]:
     needle = (text or "").strip().lower()
     if not needle:
         return "", ""
+    custom_games = _load_custom_games()
+    custom_appids = _load_custom_game_appids()
+    for key, name in custom_games.items():
+        if len(key) >= 4 and (key in needle or name.lower() == needle or name.lower() in needle):
+            return name, custom_appids.get(key, "")
     for key, name in KNOWN_GAMES.items():
         if len(key) < 4:
             continue
@@ -1293,13 +1408,68 @@ def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
         if cleaned.lower() in _FOREGROUND_TITLE_IGNORE or stem in cleaned.lower():
             return "", ""
 
+    # 1. Custom games configured by user
+    custom_games = _load_custom_games()
+    if stem in custom_games:
+        custom_appids = _load_custom_game_appids()
+        appid = custom_appids.get(stem, KNOWN_GAME_APPIDS.get(stem, ""))
+        return custom_games[stem], appid
+
+    # 2. Known games by process stem
     if stem in KNOWN_GAMES:
         return KNOWN_GAMES[stem], KNOWN_GAME_APPIDS.get(stem, "")
     if stem in KNOWN_GAME_APPIDS:
         appid = KNOWN_GAME_APPIDS[stem]
         return resolve_steam_app_name(appid), appid
 
-    return _match_game_name_from_text(cleaned)
+    # 3. Unreal Engine shipping suffix: <Game>-Win64-Shipping -> <Game>
+    shipping_m = re.match(r"^(.+)-(?:win64|win32)-shipping$", stem)
+    if shipping_m:
+        base_stem = shipping_m.group(1).lower()
+        if base_stem in custom_games:
+            custom_appids = _load_custom_game_appids()
+            return custom_games[base_stem], custom_appids.get(base_stem, KNOWN_GAME_APPIDS.get(base_stem, ""))
+        if base_stem in KNOWN_GAMES:
+            return KNOWN_GAMES[base_stem], KNOWN_GAME_APPIDS.get(base_stem, KNOWN_GAME_APPIDS.get(stem, ""))
+        if base_stem in KNOWN_GAME_APPIDS:
+            appid = KNOWN_GAME_APPIDS[base_stem]
+            return resolve_steam_app_name(appid), appid
+
+    # 4. Steam library folder: steamapps/common/<GameFolder>/...
+    steam_common_m = re.search(r"steamapps[/\\]common[/\\]([^/\\]+)", exe or "", re.IGNORECASE)
+    if steam_common_m:
+        folder = steam_common_m.group(1).strip()
+        folder_l = folder.lower()
+        if folder_l in custom_games:
+            custom_appids = _load_custom_game_appids()
+            return custom_games[folder_l], custom_appids.get(folder_l, "")
+        if folder_l in KNOWN_GAMES:
+            return KNOWN_GAMES[folder_l], KNOWN_GAME_APPIDS.get(folder_l, "")
+        if folder_l in KNOWN_GAME_APPIDS:
+            appid = KNOWN_GAME_APPIDS[folder_l]
+            return resolve_steam_app_name(appid), appid
+        folder_match, folder_appid = _match_game_name_from_text(folder)
+        if folder_match:
+            return folder_match, folder_appid
+
+    # 5. Cleaned title match against known games
+    matched_name, matched_appid = _match_game_name_from_text(cleaned)
+    if matched_name:
+        return matched_name, matched_appid
+
+    # 6. Automatic fallback for any recognized Steam common folder
+    if steam_common_m and stem not in _NON_GAME_HELPER_EXES:
+        folder = steam_common_m.group(1).strip()
+        folder_l = folder.lower()
+        non_game_folders = {
+            "steamvr", "steamworks shared", "proton", "steamlinuxruntime",
+            "steam controller config", "directx", "vcredist"
+        }
+        if folder_l not in non_game_folders and not any(f in folder_l for f in ("steamworks", "redist")):
+            display = folder if (not cleaned or len(cleaned) > 40 or cleaned.lower().startswith("shipping")) else cleaned
+            return display, _appid_for_process(stem, display)
+
+    return "", ""
 
 
 def _resolve_moonlight_display_name(proc, hosts: list[dict], cmdline: list[str]) -> str:
@@ -2149,6 +2319,7 @@ class GamerDetector:
             info.process_name = game_proc["process"]
             info.process_pid = game_proc["pid"]
             info.steam_appid = str(game_proc.get("appid") or "")
+            info.remote_metrics = dict(game_proc.get("remote_metrics") or {})
 
             session_key = f"{info.steam_appid}:{info.game_name}"
             proc_started = self._process_start_time(info.process_pid)
@@ -2189,6 +2360,7 @@ class GamerDetector:
             else:
                 apply_game_theme(info, info.steam_appid)
             self._gather_gamer_metrics(info)
+            self._apply_remote_metrics(info)
             self._last_info = info
             return info
 
@@ -2204,6 +2376,7 @@ class GamerDetector:
             elapsed_sec = max(0.0, (datetime.now().astimezone() - self._session_started_at).total_seconds())
             self._last_info.elapsed = format_playtime(elapsed_sec)
             self._gather_gamer_metrics(self._last_info)
+            self._apply_remote_metrics(self._last_info)
         return self._last_info
 
     @staticmethod
@@ -2225,7 +2398,20 @@ class GamerDetector:
     def refresh_metrics(self, info: GamerInfo) -> GamerInfo:
         """Update CPU/GPU usage and temperatures on an existing GamerInfo."""
         self._gather_gamer_metrics(info)
+        self._apply_remote_metrics(info)
         return info
+
+    @staticmethod
+    def _apply_remote_metrics(info: GamerInfo) -> None:
+        """Use hardware values announced by a remote game host when present."""
+        metrics = info.remote_metrics
+        if not metrics:
+            return
+        for key in ("gpu_temp", "gpu_usage", "cpu_temp", "cpu_usage", "memory_usage", "fps"):
+            if key in metrics:
+                setattr(info, key, float(metrics[key]))
+        if metrics.get("display_memory"):
+            info.display_memory = str(metrics["display_memory"])
 
     def _detect_game(self) -> Optional[dict]:
         """Detect a running local game, Steam Remote Play, or Moonlight stream."""
@@ -2924,32 +3110,95 @@ def render_gamer_mode(info: GamerInfo, now: datetime) -> object:
     # Session playtime (replaces the old "JOGANDO" badge)
     badge_y = min(200, max(logo_bottom + 8, 160))
     playtime = info.elapsed or "00:00:00"
-    badge_w = max(124, int(draw.textlength(playtime, font=_font(_FONT_MONO, 18)) + 28))
-    draw.rounded_rectangle((text_left, badge_y, text_left + badge_w, badge_y + 34), radius=8, fill=accent)
+    badge_w = max(116, int(draw.textlength(playtime, font=_font(_FONT_MONO, 17)) + 22))
+    draw.rounded_rectangle((text_left, badge_y, text_left + badge_w, badge_y + 32), radius=8, fill=accent)
     draw.text(
-        (text_left + badge_w // 2, badge_y + 17),
+        (text_left + badge_w // 2, badge_y + 16),
         playtime,
-        font=_font(_FONT_MONO, 18),
+        font=_font(_FONT_MONO, 17),
         fill=(12, 12, 14),
         anchor="mm",
     )
 
-    # Bottom HUD — larger hardware readouts (colors shift when load/temp is high)
+    # Optional FPS badge next to playtime if FPS is actively reported
+    if info.fps > 0:
+        fps_pill_x = text_left + badge_w + 10
+        fps_text = f"{info.fps:.0f} FPS"
+        fps_pill_w = max(86, int(draw.textlength(fps_text, font=_font(_FONT_BOLD, 16)) + 20))
+        fps_col = (80, 230, 120) if info.fps >= 60 else ((255, 200, 60) if info.fps >= 30 else (255, 75, 75))
+        draw.rounded_rectangle(
+            (fps_pill_x, badge_y, fps_pill_x + fps_pill_w, badge_y + 32),
+            radius=8,
+            fill=(12, 18, 26),
+            outline=fps_col,
+            width=2,
+        )
+        draw.text(
+            (fps_pill_x + fps_pill_w // 2, badge_y + 16),
+            fps_text,
+            font=_font(_FONT_BOLD, 16),
+            fill=fps_col,
+            anchor="mm",
+        )
+
+    # Bottom HUD — 6 hardware slots: CPU, CPU°, GPU, GPU°, VRAM, FPS
     hud_y = 250
     draw.rectangle((0, hud_y - 6, _WIDTH, _HEIGHT), fill=(6, 8, 12))
     draw.rectangle((0, hud_y - 6, _WIDTH, hud_y - 3), fill=accent)
+
+    # Format VRAM
+    vram_str = "--"
+    vram_pct = 0.0
+    if info.display_memory:
+        m = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:mib|mb|gb|g)?\s*/\s*(\d+(?:\.\d+)?)\s*(?:mib|mb|gb|g)?",
+            str(info.display_memory),
+            re.IGNORECASE,
+        )
+        if m:
+            used = float(m.group(1))
+            total = float(m.group(2))
+            if total > 100:
+                used_g, total_g = used / 1024.0, total / 1024.0
+            else:
+                used_g, total_g = used, total
+            vram_str = f"{used_g:.1f}G"
+            vram_pct = (used_g / total_g * 100.0) if total_g > 0 else 0.0
+        elif re.search(r"\d+%", str(info.display_memory)):
+            vram_str = str(info.display_memory).strip()
+            try:
+                vram_pct = float(re.search(r"(\d+)", vram_str).group(1))
+            except Exception:
+                pass
+        else:
+            vram_str = str(info.display_memory)[:6]
+
+    vram_color = _hw_level_color(vram_pct, kind="usage", fallback=accent2) if vram_pct > 0 else accent2
+
+    fps_val = f"{info.fps:.0f}" if info.fps > 0 else "--"
+    fps_color = (
+        (80, 230, 120)
+        if info.fps >= 60
+        else (
+            (255, 200, 60)
+            if info.fps >= 30
+            else ((255, 75, 75) if info.fps > 0 else (140, 155, 175))
+        )
+    )
 
     stats = [
         ("CPU", f"{info.cpu_usage:.0f}%", _hw_level_color(info.cpu_usage, kind="usage", fallback=accent2)),
         ("CPU°", f"{info.cpu_temp:.0f}°" if info.cpu_temp else "--", _hw_level_color(info.cpu_temp, kind="temp", fallback=accent)),
         ("GPU", f"{info.gpu_usage:.0f}%", _hw_level_color(info.gpu_usage, kind="usage", fallback=accent2)),
         ("GPU°", f"{info.gpu_temp:.0f}°" if info.gpu_temp else "--", _hw_level_color(info.gpu_temp, kind="temp", fallback=accent)),
+        ("VRAM", vram_str, vram_color),
+        ("FPS", fps_val, fps_color),
     ]
-    slot_w = _WIDTH // 4
+    slot_w = _WIDTH // 6
     for i, (label, value, color) in enumerate(stats):
         cx = slot_w * i + slot_w // 2
-        draw.text((cx, hud_y + 8), label, font=_font(_FONT_MONO, 15), fill=color, anchor="ma")
-        draw.text((cx, hud_y + 32), value, font=_font(_FONT_BOLD, 28), fill=color, anchor="ma")
+        draw.text((cx, hud_y + 8), label, font=_font(_FONT_MONO, 14), fill=color, anchor="ma")
+        draw.text((cx, hud_y + 32), value, font=_font(_FONT_BOLD, 26), fill=color, anchor="ma")
 
     return image_rgb
 
