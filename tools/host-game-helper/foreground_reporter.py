@@ -534,8 +534,11 @@ def poll_and_announce(interval: float, port: int) -> None:
             media = sample_media()
             lock_state = sample_lock()
             lock = {"is_locked": lock_state} if lock_state is not None else None
+            metrics = common.sample_gpu_metrics() if game else None
 
-            payload = common.build_state_payload(HOST_ID, HOSTNAME, game=game, media=media, lock=lock)
+            payload = common.build_state_payload(
+                HOST_ID, HOSTNAME, game=game, media=media, lock=lock, metrics=metrics
+            )
             common.send_payload(sock, payload, port)
 
             for note in _pop_pending_notifications():

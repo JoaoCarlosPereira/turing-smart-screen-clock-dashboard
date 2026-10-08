@@ -2552,6 +2552,36 @@ class GamerDetector:
         # GPU (NVIDIA via nvidia-smi / GPUtil; AMD via hwmon fallback)
         info.gpu_usage = self._get_gpu_usage()
         info.gpu_temp = self._get_gpu_temp()
+        info.display_memory = self._get_gpu_memory()
+
+    @staticmethod
+    def _get_gpu_memory() -> str:
+        """Return used/total VRAM for the primary GPU when the driver exposes it."""
+        try:
+            import GPUtil
+
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                used_mb = float(gpus[0].memoryUsed)
+                total_mb = float(gpus[0].memoryTotal)
+                if total_mb > 0:
+                    return f"{used_mb:.0f} MiB / {total_mb:.0f} MiB"
+        except Exception:
+            pass
+
+        # AMD Linux support is optional in the clock-only environment.
+        try:
+            import pyamdgpuinfo
+
+            pyamdgpuinfo.detect_gpus()
+            gpu = pyamdgpuinfo.get_gpu(0)
+            used_mb = float(gpu.query_vram_usage()) / (1024 * 1024)
+            total_mb = float(gpu.memory_info["vram_size"]) / (1024 * 1024)
+            if total_mb > 0:
+                return f"{used_mb:.0f} MiB / {total_mb:.0f} MiB"
+        except Exception:
+            pass
+        return ""
 
     def _get_cpu_temp(self) -> float:
         """CPU package temperature in °C."""

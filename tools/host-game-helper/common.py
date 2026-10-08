@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -104,6 +106,7 @@ def build_state_payload(
     media: dict | None = None,
     lock: dict | None = None,
     desktop: dict | None = None,
+    metrics: dict | None = None,
 ) -> dict:
     payload = {
         "v": PROTOCOL_VERSION,
@@ -121,7 +124,53 @@ def build_state_payload(
         payload["lock"] = lock
     if desktop is not None:
         payload["desktop"] = desktop
+    if metrics is not None:
+        payload["metrics"] = metrics
     return payload
+
+
+def sample_gpu_metrics() -> dict | None:
+    """Read NVIDIA metrics, or AMD VRAM/utilization from Linux sysfs."""
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            result = subprocess.run(
+                [
+                    nvidia_smi,
+                    "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                fields = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
+                if len(fields) >= 4:
+                    gpu_usage, gpu_temp, memory_used, memory_total = (float(value) for value in fields[:4])
+                    metrics = {"gpu_usage": gpu_usage, "gpu_temp": gpu_temp}
+                    if memory_total > 0:
+                        metrics["display_memory"] = f"{memory_used:.0f} MiB / {memory_total:.0f} MiB"
+                    return metrics
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+
+    # Linux AMD drivers expose these counters through DRM sysfs.
+    if os.name != "nt":
+        for device in Path("/sys/class/drm").glob("card[0-9]/device"):
+            try:
+                used = int((device / "mem_info_vram_used").read_text().strip())
+                total = int((device / "mem_info_vram_total").read_text().strip())
+            except (OSError, ValueError):
+                continue
+            metrics = {"display_memory": f"{used / 1048576:.0f} MiB / {total / 1048576:.0f} MiB"}
+            try:
+                metrics["gpu_usage"] = float((device / "gpu_busy_percent").read_text().strip())
+            except (OSError, ValueError):
+                pass
+            return metrics
+    return None
 
 
 def build_notification_payload(host_id: str, hostname: str, app: str, title: str, body: str) -> dict:
@@ -169,4 +218,3 @@ def known_game_hit(name: str) -> bool:
         if base in KNOWN_GAME_STEMS:
             return True
     return any(key in stem for key in KNOWN_GAME_STEMS if len(key) >= 4)
-

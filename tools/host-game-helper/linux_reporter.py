@@ -427,6 +427,7 @@ def poll_and_announce(interval: float, port: int) -> None:
             media = sample_media()
             lock_state = sample_lock()
             lock = {"is_locked": lock_state} if lock_state is not None else None
+            metrics = common.sample_gpu_metrics() if game else None
 
             # The wallpaper changes rarely and sampling it costs two gsettings
             # subprocesses, so re-read it only every _DESKTOP_SAMPLE_SECONDS;
@@ -438,7 +439,13 @@ def poll_and_announce(interval: float, port: int) -> None:
                 desktop_cache[0], desktop_cache[1] = nonlocal_desktop, now
 
             payload = common.build_state_payload(
-                HOST_ID, HOSTNAME, game=game, media=media, lock=lock, desktop=nonlocal_desktop
+                HOST_ID,
+                HOSTNAME,
+                game=game,
+                media=media,
+                lock=lock,
+                desktop=nonlocal_desktop,
+                metrics=metrics,
             )
             common.send_payload(sock, payload, port)
 
