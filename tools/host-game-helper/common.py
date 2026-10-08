@@ -37,6 +37,8 @@ SERVICE_NAME = "turing-host-game"
 KNOWN_GAME_STEMS = (
     "palworld",
     "palworld-win64-shipping",
+    "icarus",
+    "icarus-win64-shipping",
     "cs2",
     "csgo",
     "r5apex",
@@ -58,6 +60,14 @@ KNOWN_GAME_STEMS = (
     "overwatch",
     "modernwarfare",
     "cod",
+    "helldivers2",
+    "valheim",
+    "satisfactory",
+    "subnautica",
+    "rust",
+    "terraria",
+    "stardewvalley",
+    "lethalcompany",
 )
 
 
@@ -149,4 +159,11 @@ def known_game_hit(name: str) -> bool:
     stem = Path(name).stem.lower()
     if stem in KNOWN_GAME_STEMS:
         return True
+    if "steamapps" in name.lower() and "common" in name.lower():
+        return True
+    if stem.endswith(("-win64-shipping", "-win32-shipping")):
+        base = stem.split("-win")[0]
+        if base in KNOWN_GAME_STEMS:
+            return True
     return any(key in stem for key in KNOWN_GAME_STEMS if len(key) >= 4)
+
