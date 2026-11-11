@@ -25,6 +25,21 @@ class TestRemoteHostRegistry(unittest.TestCase):
 
     tearDown = setUp
 
+    def test_game_update_clears_missing_metrics(self):
+        game = {"title": "Palworld", "exe": "Palworld.exe", "pid": 1}
+        modes._accept_host_udp_payload({"host_id": "pc", "game": game, "metrics": {"fps": 90}})
+        self.assertEqual(modes._remote_game_hit()["remote_metrics"]["fps"], 90)
+        modes._accept_host_udp_payload({"host_id": "pc", "game": game})
+        self.assertEqual(modes._remote_game_hit()["remote_metrics"], {})
+
+    def test_other_host_state_does_not_keep_old_game_alive(self):
+        modes._accept_host_udp_payload({"host_id": "pc", "game": {"title": "Palworld", "exe": "Palworld.exe"}})
+        entry = modes._REMOTE_HOST_REGISTRY["pc"]
+        entry["game_seen_mono"] -= 6
+        modes._accept_host_udp_payload({"host_id": "pc", "media": {"title": "Music", "is_playing": True}})
+        self.assertIsNone(modes._remote_game_hit())
+        self.assertIsNone(modes._host_game_udp_payload_fresh())
+
     def test_two_hosts_tracked_independently(self):
         modes._accept_host_udp_payload(
             {

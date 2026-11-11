@@ -149,6 +149,8 @@ KNOWN_GAMES = {
     "palworld-win64-shipping": "Palworld",
     "icarus": "Icarus",
     "icarus-win64-shipping": "Icarus",
+    "lotf2": "Lords of the Fallen",
+    "lotf2-win64-shipping": "Lords of the Fallen",
     "left4dead2": "Left 4 Dead 2",
     "tf2": "Team Fortress 2",
     "bg3": "Baldur's Gate 3",
@@ -803,6 +805,8 @@ def _host_game_udp_payload_fresh(max_age: float = 5.0) -> Optional[dict]:
     for entry in _live_remote_hosts():
         if now_mono - entry["last_seen_mono"] > max_age:
             continue
+        if now_mono - entry.get("game_seen_mono", entry["last_seen_mono"]) > max_age:
+            continue
         game = entry.get("game")
         if not game:
             continue
@@ -835,6 +839,7 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
             "title": str(game_raw.get("title") or ""),
             "exe": str(game_raw.get("exe") or ""),
             "pid": int(game_raw.get("pid") or 0),
+            "appid": str(game_raw.get("appid") or ""),
         }
 
     media_raw = data.get("media")
@@ -927,13 +932,14 @@ def _accept_host_state_payload(data: dict, source_ip: str) -> None:
         # known state, mirroring the old cache's "do not clear on empty" rule.
         if game is not None:
             entry["game"] = game
+            entry["game_seen_mono"] = now_mono
         if media is not None:
             entry["media"] = media
         if lock is not None:
             entry["lock"] = lock
         if desktop is not None:
             entry["desktop"] = desktop
-        if metrics is not None:
+        if metrics is not None or game is not None:
             entry["metrics"] = metrics
 
     if game is not None:
@@ -986,6 +992,8 @@ def pop_remote_notifications() -> list[dict]:
 def _remote_game_hit() -> Optional[dict]:
     """Most-recently-updated remote host whose game passes the local trust list."""
     for entry in _live_remote_hosts():
+        if time.monotonic() - entry.get("game_seen_mono", entry["last_seen_mono"]) > 5.0:
+            continue
         game = entry.get("game")
         if not game:
             continue
@@ -1385,7 +1393,9 @@ def _classify_helper_payload(payload: dict) -> tuple[str, str]:
     stem = Path(exe.replace("\\", "/")).stem.lower()
     if stem in _NON_GAME_HELPER_EXES:
         return "", ""
-    return _match_game_from_foreground(title, exe)
+    name, appid = _match_game_from_foreground(title, exe)
+    announced_appid = str(payload.get("appid") or "")
+    return name, announced_appid if name and announced_appid.isdigit() else appid
 
 
 def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
@@ -1398,6 +1408,10 @@ def _match_game_from_foreground(title: str, exe: str = "") -> tuple[str, str]:
     stem = Path((exe or "").replace("\\", "/")).stem.lower()
     cleaned = _clean_foreground_title(title, exe)
     if not cleaned:
+        return "", ""
+    if "steamapps/common/" in (exe or "").replace("\\", "/").lower() and any(
+        part in stem for part in ("launcher", "crash", "unins", "setup", "redist", "overlay", "anticheat")
+    ):
         return "", ""
     if stem in _BORING_FOREGROUND_STEMS and cleaned.lower() in _FOREGROUND_TITLE_IGNORE:
         return "", ""
@@ -1520,11 +1534,12 @@ def _resolve_moonlight_game_info(proc, hosts: list[dict], cmdline: list[str]) ->
 
     if app_id and app_id != "0":
         mapped = _moonlight_app_name_from_hosts(hosts, app_id)
-        if mapped:
+        matched_name, matched_appid = _match_game_name_from_text(mapped or "")
+        if matched_name:
             name = _format_moonlight_session_name(mapped, hostname)
             return {
                 "display_name": name,
-                "appid": _appid_for_process("moonlight", mapped),
+                "appid": matched_appid or _appid_for_process("moonlight", mapped),
                 "is_game": True,
             }
         # "App <id>" is an unlabelled Sunshine entry (often the Desktop app).
@@ -2364,19 +2379,11 @@ class GamerDetector:
             self._last_info = info
             return info
 
-        # No game detected — keep session briefly, then clear
-        if not self._last_info.game_name or (time.monotonic() - self._last_seen_mono) > 30:
-            self._last_info = GamerInfo()
-            self._last_game_process = None
-            self._session_key = ""
-            self._session_started_at = None
-            return self._last_info
-
-        if self._session_started_at:
-            elapsed_sec = max(0.0, (datetime.now().astimezone() - self._session_started_at).total_seconds())
-            self._last_info.elapsed = format_playtime(elapsed_sec)
-            self._gather_gamer_metrics(self._last_info)
-            self._apply_remote_metrics(self._last_info)
+        # ModeManager already confirms consecutive misses before leaving GAMER.
+        self._last_info = GamerInfo()
+        self._last_game_process = None
+        self._session_key = ""
+        self._session_started_at = None
         return self._last_info
 
     @staticmethod
@@ -2467,6 +2474,16 @@ class GamerDetector:
                             "appid": game_info.get("appid")
                             or _appid_for_process(proc_name, game_info["display_name"]),
                         }
+                        for entry in _live_remote_hosts():
+                            if entry.get("source_ip") not in moonlight_ips:
+                                continue
+                            remote_name, remote_appid = _classify_helper_payload(entry.get("game") or {})
+                            if remote_name and (
+                                (remote_appid and remote_appid == moonlight_hit["appid"])
+                                or remote_name.casefold() == moonlight_hit["display_name"].casefold()
+                            ):
+                                moonlight_hit["remote_metrics"] = dict(entry.get("metrics") or {})
+                                break
                 continue
 
             # Steam Remote Play — need cmdline only for these names
@@ -2518,6 +2535,20 @@ class GamerDetector:
                 }
                 break
 
+            # Games installed locally in a Steam library need not be listed in
+            # KNOWN_GAMES. Resolve only Steam executables, not desktop apps.
+            try:
+                executable = os.readlink(f"/proc/{pid}/exe")
+            except OSError:
+                continue
+            if "/steamapps/common/" not in executable.lower():
+                continue
+            display_name, appid = _match_game_from_foreground(proc_name, executable)
+            if display_name:
+                known_hit = {"process": proc_name, "display_name": display_name,
+                             "pid": pid, "appid": appid}
+                break
+
         if known_hit and not known_hit.get("appid"):
             known_hit["appid"] = _appid_for_process(known_hit["process"], known_hit["display_name"])
         if stream_hit and not stream_hit.get("appid"):
@@ -2539,6 +2570,7 @@ class GamerDetector:
 
     def _gather_gamer_metrics(self, info: GamerInfo, pid: Optional[int] = None):
         """Gather system-wide CPU/GPU usage and temperatures."""
+        info.fps = 0.0
         # System CPU usage (0-100), non-blocking after first sample
         info.cpu_usage = float(psutil.cpu_percent(interval=None))
         if info.cpu_usage == 0.0:
@@ -3149,27 +3181,6 @@ def render_gamer_mode(info: GamerInfo, now: datetime) -> object:
         fill=(12, 12, 14),
         anchor="mm",
     )
-
-    # Optional FPS badge next to playtime if FPS is actively reported
-    if info.fps > 0:
-        fps_pill_x = text_left + badge_w + 10
-        fps_text = f"{info.fps:.0f} FPS"
-        fps_pill_w = max(86, int(draw.textlength(fps_text, font=_font(_FONT_BOLD, 16)) + 20))
-        fps_col = (80, 230, 120) if info.fps >= 60 else ((255, 200, 60) if info.fps >= 30 else (255, 75, 75))
-        draw.rounded_rectangle(
-            (fps_pill_x, badge_y, fps_pill_x + fps_pill_w, badge_y + 32),
-            radius=8,
-            fill=(12, 18, 26),
-            outline=fps_col,
-            width=2,
-        )
-        draw.text(
-            (fps_pill_x + fps_pill_w // 2, badge_y + 16),
-            fps_text,
-            font=_font(_FONT_BOLD, 16),
-            fill=fps_col,
-            anchor="mm",
-        )
 
     # Bottom HUD — 6 hardware slots: CPU, CPU°, GPU, GPU°, VRAM, FPS
     hud_y = 250

@@ -250,12 +250,39 @@ class TestResolveMoonlightGameInfo(unittest.TestCase):
         info = self._no_helper(["moonlight", "stream", "192.168.0.10", "Área de Trabalho"])
         self.assertFalse(info["is_game"])
 
+    def test_sunshine_desktop_entry_is_not_a_game(self):
+        from unittest.mock import patch
+        with patch.object(modes, "_query_host_game_helper", return_value=None), \
+             patch.object(modes, "_query_sunshine_current_game", return_value="42"), \
+             patch.object(modes, "_moonlight_app_name_from_hosts", return_value="Desktop"):
+            info = _resolve_moonlight_game_info(None, [{"ips": ["192.168.2.177"]}], [])
+        self.assertFalse(info["is_game"])
+        self.assertEqual(info["display_name"], "")
+
+    def test_sunshine_recognized_game_entry_is_a_game(self):
+        from unittest.mock import patch
+        with patch.object(modes, "_query_host_game_helper", return_value=None), \
+             patch.object(modes, "_query_sunshine_current_game", return_value="42"), \
+             patch.object(modes, "_moonlight_app_name_from_hosts", return_value="Palworld"):
+            info = _resolve_moonlight_game_info(None, [{"ips": ["192.168.2.177"]}], [])
+        self.assertTrue(info["is_game"])
+
 
 class TestDetectGameGatesOnIsGame(unittest.TestCase):
     MOONLIGHT = _FakeProcess("moonlight", 1234, 500, cmdline=[], exe="/snap/bin/moonlight")
 
     def tearDown(self):
         modes._REMOTE_HOST_REGISTRY.clear()
+
+    def test_closed_local_game_does_not_remain_detected(self):
+        from unittest.mock import patch
+        detector = GamerDetector.__new__(GamerDetector)
+        detector._last_info = modes.GamerInfo(game_name="Palworld")
+        detector._last_game_process = "palworld"
+        detector._session_key = "Palworld"
+        detector._session_started_at = None
+        with patch.object(detector, "_detect_game", return_value=None):
+            self.assertEqual(detector.detect().game_name, "")
 
     def test_recognized_game_enters(self):
         hit = _run_detect_game(

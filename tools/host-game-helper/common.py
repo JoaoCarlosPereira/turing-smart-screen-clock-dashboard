@@ -20,17 +20,57 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 
 PROTOCOL_VERSION = 2
 DEFAULT_PORT = 8787
 MULTICAST_GROUP = "239.255.87.87"
 SERVICE_NAME = "turing-host-game"
+
+
+def game_executable_hit(exe: str) -> bool:
+    """Recognize known executables and games installed in Steam libraries."""
+    path = (exe or "").replace("\\", "/")
+    match = re.search(r"/steamapps/common/([^/]+)/(.+\.exe)$", path, re.IGNORECASE)
+    if not match:
+        return known_game_hit(path.rsplit("/", 1)[-1])
+    folder, relative = match.groups()
+    folder = folder.casefold()
+    stem = relative.rsplit("/", 1)[-1][:-4].casefold()
+    if any(part in folder for part in ("steamworks", "redist", "proton", "steamlinuxruntime")):
+        return False
+    return not any(part in stem for part in ("launcher", "crash", "unins", "setup", "redist", "overlay", "anticheat", "easyanticheat"))
+
+
+@lru_cache(maxsize=128)
+def steam_appid_for_executable(exe: str) -> str:
+    """Find the matching Steam app manifest in the executable's library."""
+    path = Path(exe)
+    for parent in path.parents:
+        if parent.name.casefold() != "common" or parent.parent.name.casefold() != "steamapps":
+            continue
+        try:
+            folder = path.relative_to(parent).parts[0]
+            for manifest in parent.parent.glob("appmanifest_*.acf"):
+                try:
+                    content = manifest.read_text(encoding="utf-8-sig", errors="replace")
+                except OSError:
+                    continue
+                install = re.search(r'"installdir"\s*"([^"]+)"', content, re.IGNORECASE)
+                appid = re.fullmatch(r"appmanifest_(\d+)\.acf", manifest.name, re.IGNORECASE)
+                if install and appid and install.group(1).casefold() == folder.casefold():
+                    return appid.group(1)
+        except (OSError, ValueError, IndexError):
+            pass
+        break
+    return ""
 
 # Reporter-side "is this worth sending as a game" filter. The Mini-PC re-validates
 # everything against its own modes.py::KNOWN_GAMES before trusting it either way,
@@ -41,6 +81,8 @@ KNOWN_GAME_STEMS = (
     "palworld-win64-shipping",
     "icarus",
     "icarus-win64-shipping",
+    "lotf2",
+    "lotf2-win64-shipping",
     "cs2",
     "csgo",
     "r5apex",

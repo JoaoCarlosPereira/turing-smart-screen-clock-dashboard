@@ -18,6 +18,7 @@ Windows only.
 from __future__ import annotations
 
 import argparse
+import atexit
 import asyncio
 import os
 import sys
@@ -35,6 +36,7 @@ from ctypes import wintypes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402  (needs sys.path tweak above when double-clicked from elsewhere)
+from fps_monitor import FpsMonitor  # noqa: E402
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -238,9 +240,9 @@ def _find_running_known_game() -> dict | None:
     """Pick a running known game process (largest chance: Palworld while helper has focus)."""
     best = None
     for pid, exe_name in _iter_processes():
-        if not _known_game_hit(exe_name):
-            continue
         image = _process_image(pid) or exe_name
+        if not common.game_executable_hit(image):
+            continue
         # Prefer shipping/client binaries over launchers when both exist
         score = 2 if "shipping" in Path(image).stem.lower() else 1
         candidate = {
@@ -276,7 +278,7 @@ def _find_visible_game_window() -> dict | None:
         exe = _process_image(int(pid.value))
         if _is_boring(title, exe):
             return True
-        if _known_game_hit(exe) or _known_game_hit(title):
+        if common.game_executable_hit(exe) or _known_game_hit(title):
             found = {
                 "title": _friendly_game_title(title, exe),
                 "exe": exe,
@@ -305,15 +307,15 @@ def sample_foreground() -> dict:
         "updated_at": time.time(),
     }
 
-    # If focus is on the helper/terminal, prefer a running/visible game.
-    if _is_boring(title, exe) or (len(title.strip()) < 4 and not _known_game_hit(exe)):
+    # A game remains active when the user focuses a browser or another app.
+    if not common.game_executable_hit(exe) and not _known_game_hit(title):
         game = _find_visible_game_window() or _find_running_known_game()
         if game:
             payload.update(game)
             payload["updated_at"] = time.time()
             payload["v"] = 1
             payload["service"] = SERVICE_NAME
-    elif _known_game_hit(exe):
+    elif common.game_executable_hit(exe):
         payload["title"] = _friendly_game_title(title, exe)
 
     return payload
@@ -518,6 +520,8 @@ class Handler(BaseHTTPRequestHandler):
 def poll_and_announce(interval: float, port: int) -> None:
     global _LAST_LOG
     sock = common.make_udp_socket()
+    fps_monitor = FpsMonitor()
+    atexit.register(fps_monitor.stop)
     while True:
         try:
             game_sample = sample_foreground()
@@ -531,10 +535,17 @@ def poll_and_announce(interval: float, port: int) -> None:
                     "exe": game_sample.get("exe", ""),
                     "pid": game_sample.get("pid", 0),
                 }
+                game["appid"] = common.steam_appid_for_executable(game["exe"])
             media = sample_media()
             lock_state = sample_lock()
             lock = {"is_locked": lock_state} if lock_state is not None else None
             metrics = common.sample_gpu_metrics() if game else None
+            fps = fps_monitor.sample(game.get("pid") if game and (
+                common.game_executable_hit(game.get("exe", "")) or _known_game_hit(game.get("title", ""))
+            ) else 0)
+            if fps is not None:
+                metrics = metrics or {}
+                metrics["fps"] = fps
 
             payload = common.build_state_payload(
                 HOST_ID, HOSTNAME, game=game, media=media, lock=lock, metrics=metrics

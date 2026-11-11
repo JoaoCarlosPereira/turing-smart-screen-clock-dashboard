@@ -31,6 +31,21 @@ Na primeira execução o Windows pode perguntar se o Python pode usar a rede
 **acesso a notificações** (Windows → Configurações → Notificações) — aceite
 uma vez; sem isso, só jogo/mídia são reportados.
 
+### FPS dos jogos no Windows
+
+O FPS requer o executável de linha de comando [PresentMon](https://github.com/GameTechDev/PresentMon/releases)
+no PC do jogo. Baixe a versão oficial e coloque o executável de captura na
+mesma pasta do agente com o nome `PresentMon.exe`, ou deixe `PresentMon.exe`
+no PATH. Alternativamente, defina `PRESENTMON_PATH` com o caminho completo.
+Atualize a pasta do agente no Windows e reinicie o agente após instalar.
+O agente inicia a captura para o processo do jogo reconhecido e envia o FPS
+pela rede; sem uma medição recente a tela mostra `--`.
+
+O PresentMon precisa de privilégios de administrador ou de uma conta no grupo
+**Performance Log Users**; alterações na associação ao grupo exigem sair e
+entrar novamente no Windows. Consulte as instruções oficiais do PresentMon.
+Nem todos os jogos ou APIs fornecem dados de captura nas mesmas condições.
+
 ## Ubuntu / Linux
 
 1. Copie a pasta `tools/host-game-helper` para o PC Ubuntu.
